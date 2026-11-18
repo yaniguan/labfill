@@ -148,7 +148,10 @@ def sample_random_topological_orders(
     num_samples: int = 256,
     seed: int = 0,
 ) -> tuple[Tensor, float]:
-    """Sample uniformly random topological sorts (ignoring physical rules) and check pass rate."""
+    """Sample random topological sorts (ignoring physical rules) and check pass rate.
+
+    Orders come from random-priority greedy selection, which is not uniform over all orderings.
+    """
     s = problem.steps.max_steps
     if s > 62:
         raise ValueError("Bitmask DAG sampler supports up to 62 steps")

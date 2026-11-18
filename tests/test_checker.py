@@ -160,4 +160,5 @@ def test_python_vs_batched_equivalence_on_thousands_of_random_protocols() -> Non
         assert torch.equal(rb.ok, rp.ok)
         assert torch.equal(rb.err_code, rp.err_code)
         assert torch.equal(rb.first_err_step, rp.first_err_step)
-        assert torch.equal(rb.final_state.volume, rp.final_state.volume)
+        for fname in ("volume", "capacity", "sealed", "frozen", "reagent_mask", "has_tip", "tip_mask"):
+            assert torch.equal(getattr(rb.final_state, fname), getattr(rp.final_state, fname)), fname

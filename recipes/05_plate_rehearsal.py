@@ -33,7 +33,7 @@ def main() -> None:
 
     print(f"Plates rehearsed         : {pr.batch_size} (steps={pr.max_steps})")
     print(f"All valid                : {bool(res.check.ok.all().item())}")
-    print(f"Volume conserved         : {bool(res.volume_conserved.all().item())}")
+    print(f"Volume conserved (sanity check, true by construction): {bool(res.volume_conserved.all().item())}")
     print(f"Throughput               : {pr.batch_size / res.elapsed_sec:,.0f} plates/s ({res.elapsed_sec * 1000:.1f} ms)")
     concs = [round(c, 4) for c in res.solute_conc[0, 0, :8].tolist()]
     vols = res.well_volumes_ul[0, 0, :8].tolist()

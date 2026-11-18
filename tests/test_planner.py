@@ -16,7 +16,8 @@ from labfill.planner import (
 def test_dag_beam_planner() -> None:
     dag = make_assay_dag_problem()
     _, rand_rate = sample_random_topological_orders(dag, num_samples=128, seed=0)
-    assert 0.0 <= rand_rate < 0.5  # Most naive topological sorts violate tip rules
+    # Naive topological sorts almost always violate physical rules (seed 0 passes 2 of 128)
+    assert 0.0 <= rand_rate <= 0.1
 
     plan = batched_beam_plan_dag(dag, beam_width=24)
     assert plan.found is True

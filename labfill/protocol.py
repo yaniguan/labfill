@@ -569,8 +569,8 @@ def make_random_valid_protocols(
     pad_mask[:, cur] = False
     cur += 1
 
-    # Variable length: randomly mask off the last 0..2 optional steps on half the batch
-    # or add a sealed centrifuge spin when well 3 and C-1 are within 5 uL
+    # Variable length: on ~70% of protocols where well 3 and C-1 are within rotor tolerance,
+    # append seal + seal + centrifuge; the rest stay padded
     balanced = (tracked_vol[:, 3] - tracked_vol[:, num_containers - 1]).abs() <= ROTOR_TOL_TENTHS_UL
     do_spin = balanced & (torch.rand((batch_size,), generator=g) > 0.3)
     if cur + 3 <= max_steps:
@@ -634,7 +634,7 @@ def make_random_protocols(
     n_bad = int(corrupt_mask.sum())
     if n_bad > 0:
         idx = corrupt_mask.nonzero(as_tuple=False).squeeze(1)
-        # Inject completely random ops/args at 1..3 step positions per selected protocol
+        # Inject completely random ops/args at 2 step positions per selected protocol (may coincide)
         for _ in range(2):
             step_pos = torch.randint(0, max_steps, (n_bad,), generator=g)
             proto.pad_mask[idx, step_pos] = False
