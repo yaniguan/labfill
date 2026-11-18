@@ -19,6 +19,7 @@ from labfill.protocol import (
     ERR_OVERFLOW,
     ERR_SEALED,
     LabStateBatch,
+    OP_CENTRIFUGE,
     OP_DROP_TIP,
     OP_INCUBATE,
     OP_MIX,
@@ -32,6 +33,7 @@ from labfill.protocol import (
     PIP_P20,
     PIP_P200,
     PIP_P1000,
+    PIPETTE_RANGES_TENTHS_UL,
     ProtocolBatch,
     make_random_valid_protocols,
 )
@@ -228,7 +230,7 @@ def make_error_twin(
 @dataclass
 class TwinRecallReport:
     per_error_recall: dict[str, float]
-    per_error_primary_code_match: dict[str, float]
+    per_error_primary_code_match: dict[str, float]  # only error types in EXPECTED_PRIMARY_CODES
     false_positive_rate_on_valid: float
     batch_size_per_type: int
 
@@ -253,12 +255,11 @@ def measure_twin_recall(
         res = check_protocols_batched(st_tw, pr_tw)
         detected = ~res.ok
         recalls[etype] = float(detected.float().mean().item())
+        # swapped_steps has no single expected code, so it gets no code-match entry
+        # (reporting recall again under another name would double-count it)
         if etype in EXPECTED_PRIMARY_CODES:
             exp = EXPECTED_PRIMARY_CODES[etype]
             code_matches[etype] = float((res.err_code == exp).float().mean().item())
-        else:
-            # Swapped steps typically trigger no_tip or tip_already_on
-            code_matches[etype] = recalls[etype]
 
     return TwinRecallReport(
         per_error_recall=recalls,
@@ -299,7 +300,8 @@ def sample_noisy_candidates(
     g = torch.Generator(device="cpu")
     g.manual_seed(seed + 4242)
 
-    # Apply independent noisy mutations across candidates so ~35-55% remain valid
+    # Mutate a 1 - (1 - mutation_rate)^3 fraction of candidates; some mutations leave the
+    # protocol valid, so the kept fraction is higher than the unmutated fraction
     mutate = torch.rand((num_candidates,), generator=g) < (1.0 - (1.0 - mutation_rate) ** 3)
     m_idx = mutate.nonzero(as_tuple=False).squeeze(1)
     n_m = int(m_idx.numel())
@@ -319,7 +321,7 @@ def sample_noisy_candidates(
             s1 = step[kind == 1]
             pr.pipette[k1, s1] = torch.randint(1, 5, (k1.numel(),), generator=g)
 
-        # 2: random source/dst well
+        # 2: random source well
         k2 = m_idx[kind == 2]
         if k2.numel() > 0:
             s2 = step[kind == 2]
@@ -404,6 +406,14 @@ def generate_check_keep(
 
 @dataclass
 class RepairResult:
+    """Outcome of `batched_repair`.
+
+    `num_repaired` / `repair_rate` count only intent-preserving repairs: edits that never delete
+    or redirect a transfer, mix, incubate, thaw or centrifuge step. Protocols that only an
+    intent-changing edit could make pass are counted in `num_fixed_only_by_intent_change` and are
+    not in `repaired_mask`.
+    """
+
     num_broken: int
     candidates_per_protocol: int
     num_repaired: int
@@ -412,6 +422,32 @@ class RepairResult:
     protocols_repaired_per_sec: float
     repaired_protocols: ProtocolBatch
     repaired_mask: Tensor
+    chosen_edit: Tensor  # (M,) int64 winning edit id, -1 if not repaired
+    edit_type_counts: dict[str, int]  # winning edit kind -> number of repaired protocols
+    num_fixed_only_by_intent_change: int
+
+
+# Ops whose deletion (or redirection) changes what the protocol does, not just how it does it
+INTENT_OPS: tuple[int, ...] = (OP_TRANSFER, OP_MIX, OP_INCUBATE, OP_THAW, OP_CENTRIFUGE)
+
+
+def repair_edit_kind(edit_id: int) -> str:
+    """Name of the single-edit family proposed at slot `edit_id` by `_propose_k_edits`."""
+    if edit_id < 4:
+        return "set_pipette"
+    if edit_id < 8:
+        return "clamp_volume"
+    if edit_id < 10:
+        return "fix_incubate"
+    if edit_id == 10:
+        return "delete_step"
+    if edit_id < 13:
+        return "swap_adjacent"
+    if edit_id < 21:
+        return "insert_step"
+    if edit_id == 21:
+        return "delete_prior_seal"
+    return "redirect_dst"
 
 
 def _propose_k_edits(
@@ -419,8 +455,13 @@ def _propose_k_edits(
     broken_proto: ProtocolBatch,
     first_err_step: Tensor,
     num_edits: int = 24,
+    state_at_err: LabStateBatch | None = None,
 ) -> tuple[LabStateBatch, ProtocolBatch]:
-    """Expand M broken protocols into M * K single-edit repair candidates of length T + 1."""
+    """Expand M broken protocols into M * K single-edit repair candidates of length T + 1.
+
+    `state_at_err` is the state just before each protocol's failing step (the checker's
+    `final_state`); volume clamps use it to keep as much of the intended volume as fits.
+    """
     m = broken_proto.batch_size
     c = init_state.num_containers
     dev = broken_proto.device
@@ -447,13 +488,24 @@ def _propose_k_edits(
         if r.numel() > 0:
             cand.pipette[r, stp] = pip
 
-    # Edits 4..7: clamp volume + matching pipette at err_t (fixes overflow / not_enough / bad_pipette)
-    for offset, (v_target, pip) in enumerate(
-        ((10, PIP_P2), (100, PIP_P20), (500, PIP_P200), (1500, PIP_P1000))
-    ):
+    # Edits 4..7: reduce volume at err_t only as far as needed (fixes overflow / not_enough).
+    # vol = min(original, free dst capacity, src volume, pipette max); pipettes are tried largest
+    # first so the lowest passing edit id keeps the most of the intended volume.
+    if state_at_err is None:
+        state_at_err = check_protocols_batched(init_state, broken_proto).final_state
+    b_idx_m0 = torch.arange(m, device=dev)
+    t_m0 = first_err_step.clamp(0, broken_proto.max_steps - 1)
+    s_m0 = broken_proto.src[b_idx_m0, t_m0].clamp(0, c - 1)
+    d_m0 = broken_proto.dst[b_idx_m0, t_m0].clamp(0, c - 1)
+    op_m0 = broken_proto.op[b_idx_m0, t_m0]
+    src_avail = state_at_err.volume[b_idx_m0, s_m0]
+    dst_free = state_at_err.capacity[b_idx_m0, d_m0] - state_at_err.volume[b_idx_m0, d_m0]
+    fit_vol = torch.minimum(broken_proto.vol[b_idx_m0, t_m0], src_avail)
+    fit_vol = torch.where(op_m0 == OP_TRANSFER, torch.minimum(fit_vol, dst_free), fit_vol)
+    for offset, pip in enumerate((PIP_P1000, PIP_P200, PIP_P20, PIP_P2)):
         r, stp = rows_for(4 + offset)
         if r.numel() > 0:
-            cand.vol[r, stp] = v_target
+            cand.vol[r, stp] = fit_vol[item_idx[r]].clamp(max=PIPETTE_RANGES_TENTHS_UL[pip][1])
             cand.pipette[r, stp] = pip
 
     # Edits 8..9: fix bad incubation temperature / duration
@@ -463,7 +515,8 @@ def _propose_k_edits(
             cand.temp[r, stp] = tc
             cand.duration[r, stp] = cand.duration[r, stp].clamp(min=30)
 
-    # Edit 10: delete offending step (e.g. extra pick_tip, drop_tip, seal)
+    # Edit 10: delete offending step (e.g. extra pick_tip, drop_tip, seal).
+    # batched_repair does not count it when the deleted step is one of INTENT_OPS.
     r, stp = rows_for(10)
     if r.numel() > 0:
         cand.op[r, stp] = OP_NOOP
@@ -552,27 +605,56 @@ def batched_repair(
     broken_protocols: ProtocolBatch,
     num_edits: int = 24,
 ) -> RepairResult:
-    """Try K single-edit fixes per broken protocol in one batched checker pass."""
-    if init_state.device.type == "cuda":
+    """Try K single-edit fixes per broken protocol in one batched checker pass.
+
+    The lowest-numbered passing edit wins, but only among intent-preserving edits: deleting a
+    step in INTENT_OPS (edit 10) and redirecting a destination (edits 22+) never count as repairs.
+    """
+    dev = init_state.device
+    if dev.type == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     m = broken_protocols.batch_size
     init_check = check_protocols_batched(init_state, broken_protocols)
     st_cand, pr_cand = _propose_k_edits(
-        init_state, broken_protocols, init_check.first_err_step, num_edits=num_edits
+        init_state,
+        broken_protocols,
+        init_check.first_err_step,
+        num_edits=num_edits,
+        state_at_err=init_check.final_state,
     )
     cand_check = check_protocols_batched(st_cand, pr_cand)
 
     ok_grid = cand_check.ok.view(m, num_edits)
-    repaired_mask = ok_grid.any(dim=1)
-    best_edit = ok_grid.to(torch.int64).argmax(dim=1)
-    chosen_flat = torch.arange(m, device=init_state.device) * num_edits + best_edit
-    best_protos = pr_cand.index_select(chosen_flat)
 
-    if init_state.device.type == "cuda":
+    # Mask out intent-changing edits
+    allowed = torch.ones((m, num_edits), dtype=torch.bool, device=dev)
+    if num_edits > 10:
+        t_err = init_check.first_err_step.clamp(0, broken_protocols.max_steps - 1)
+        op_err = broken_protocols.op[torch.arange(m, device=dev), t_err]
+        deletes_intent = torch.zeros_like(op_err, dtype=torch.bool)
+        for op_id in INTENT_OPS:
+            deletes_intent |= op_err == op_id
+        allowed[:, 10] = ~deletes_intent
+    allowed[:, 22:] = False
+
+    honest_ok = ok_grid & allowed
+    repaired_mask = honest_ok.any(dim=1)
+    intent_only = (ok_grid & ~allowed).any(dim=1) & ~repaired_mask
+    best_edit = honest_ok.to(torch.int64).argmax(dim=1)
+    chosen_flat = torch.arange(m, device=dev) * num_edits + best_edit
+    best_protos = pr_cand.index_select(chosen_flat)
+    chosen_edit = torch.where(repaired_mask, best_edit, torch.full_like(best_edit, -1))
+
+    if dev.type == "cuda":
         torch.cuda.synchronize()
     elapsed = max(time.perf_counter() - t0, 1e-9)
+
+    edit_type_counts: dict[str, int] = {}
+    for eid in chosen_edit[repaired_mask].tolist():
+        kind = repair_edit_kind(int(eid))
+        edit_type_counts[kind] = edit_type_counts.get(kind, 0) + 1
 
     n_rep = int(repaired_mask.sum().item())
     return RepairResult(
@@ -584,4 +666,7 @@ def batched_repair(
         protocols_repaired_per_sec=m / elapsed,
         repaired_protocols=best_protos,
         repaired_mask=repaired_mask,
+        chosen_edit=chosen_edit,
+        edit_type_counts=edit_type_counts,
+        num_fixed_only_by_intent_change=int(intent_only.sum().item()),
     )

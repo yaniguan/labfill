@@ -150,8 +150,10 @@ def bench_recipe2(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
             {
                 "error_type": et,
                 "detection_recall": recall_rep.per_error_recall[et],
-                "primary_code_match": recall_rep.per_error_primary_code_match[et],
+                "primary_code_match": recall_rep.per_error_primary_code_match.get(et, "n/a"),
                 "repair_rate_k24": round(rep_frac, 4),
+                "repair_edit_type_counts": rr.edit_type_counts,
+                "fixed_only_by_intent_change": rr.num_fixed_only_by_intent_change,
                 "repair_cpu_proto_per_sec": round(statistics.median(rates), 1),
                 "repair_gpu_proto_per_sec": "not yet measured",
             }
@@ -349,13 +351,18 @@ def format_markdown_report(payload: dict[str, Any]) -> str:
         f"- **Generate-N / Check / Keep (`N={gk['num_candidates']}`)**: kept `{gk['kept_fraction']:.1%}` "
         f"at `{gk['cpu_candidates_per_sec']:,.1f}` candidates/s on CPU (GPU: `{gk['gpu_candidates_per_sec']}`)\n"
     )
-    lines.append("| Error Type | Detection Recall | Repair Rate (K=24) | Repair CPU (proto/s) | Repair GPU (proto/s) |")
-    lines.append("|---|---:|---:|---:|---|")
+    lines.append(
+        "Repair Rate counts only edits that keep every transfer and mix step; deleting or "
+        "redirecting one is reported separately and not counted.\n"
+    )
+    lines.append("| Error Type | Detection Recall | Repair Rate (K=24) | Winning Edits | Intent-Change Only | Repair CPU (proto/s) | Repair GPU (proto/s) |")
+    lines.append("|---|---:|---:|---|---:|---:|---|")
     for tr in r2["twins_and_repair"]:
+        edits = ", ".join(f"{k}: {v}" for k, v in tr.get("repair_edit_type_counts", {}).items()) or "—"
         lines.append(
             f"| `{tr['error_type']}` | {tr['detection_recall']:.1%} | "
-            f"{tr['repair_rate_k24']:.1%} | {tr['repair_cpu_proto_per_sec']:,.1f} | "
-            f"{tr['repair_gpu_proto_per_sec']} |"
+            f"{tr['repair_rate_k24']:.1%} | {edits} | {tr.get('fixed_only_by_intent_change', 'n/a')} | "
+            f"{tr['repair_cpu_proto_per_sec']:,.1f} | {tr['repair_gpu_proto_per_sec']} |"
         )
     lines.append("")
 
@@ -402,7 +409,7 @@ def format_markdown_report(payload: dict[str, Any]) -> str:
     # Recipe 5
     r5 = payload["recipe5_plate_rehearsal"]
     lines.append("## Recipe 5: Batched 96-Well Plate Rehearsal\n")
-    lines.append("| Batch Plates | Steps / Plate | Volume Conserved | CPU (plates/s) | CPU Time (ms) | GPU (plates/s) |")
+    lines.append("| Batch Plates | Steps / Plate | Volume Conserved (sanity check, true by construction) | CPU (plates/s) | CPU Time (ms) | GPU (plates/s) |")
     lines.append("|---:|---:|---|---:|---:|---|")
     lines.append(
         f"| {r5['batch_plates']} | {r5['steps_per_plate']} | `{r5['volume_conserved']}` | "
