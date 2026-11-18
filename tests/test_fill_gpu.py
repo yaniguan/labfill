@@ -1,15 +1,92 @@
 from __future__ import annotations
 
+import pytest
 import torch
+import torch.nn.functional as F
 
 from labfill.fill_gpu import (
+    CudaGraphStepRunner,
     ProtocolTransformer,
+    build_block_diag_mask,
     collate_padded_pairs,
     collate_varlen_pairs,
     count_batch_training_flops,
     pack_sequence_pairs,
     run_fill_gpu_ablation,
+    tiled_local_global_attention,
 )
+
+
+def _seq_id_row(lengths: list[int], s: int) -> torch.Tensor:
+    sid = torch.zeros((1, s), dtype=torch.int64)
+    start = 0
+    for k, n in enumerate(lengths, start=1):
+        sid[0, start : start + n] = k
+        start += n
+    return sid
+
+
+def _reference_local_global_mask(seq_id: torch.Tensor, w: int, g: int, causal: bool) -> torch.Tensor:
+    """Dense (B, 1, S, S) mask with the same sparsity as the tiled kernel, each key counted once."""
+    s = seq_id.shape[1]
+    i = torch.arange(s).unsqueeze(1)
+    j = torch.arange(s).unsqueeze(0)
+    in_window = ((j // w) == (i // w)) | ((j // w) == (i // w) - 1) | (j < g)
+    if causal:
+        in_window = in_window & (j <= i)
+    same = (seq_id.unsqueeze(2) == seq_id.unsqueeze(1)) & (seq_id.unsqueeze(2) > 0)
+    allowed = same & in_window.unsqueeze(0)
+    eye = torch.eye(s, dtype=torch.bool).unsqueeze(0)
+    return torch.where((seq_id == 0).unsqueeze(2), eye, allowed).unsqueeze(1)
+
+
+@pytest.mark.parametrize(("length", "causal"), [(40, False), (64, False), (128, True)])
+def test_block_sparse_matches_dense_when_sequence_fits_window(length: int, causal: bool) -> None:
+    # Non-causal block-0 queries only see block 0, so the sequence must fit in W=64 tokens;
+    # causal queries never look ahead, so a 2W = 128 token sequence is fully covered.
+    torch.manual_seed(0)
+    s, w = 256, 64
+    q, k, v = (torch.randn(2, 4, s, 16) for _ in range(3))
+    sid = _seq_id_row([length], s).expand(2, s).contiguous()
+
+    sparse = tiled_local_global_attention(q, k, v, seq_id=sid, block_size=w, num_global_tokens=4, causal=causal)
+    dense = F.scaled_dot_product_attention(q, k, v, attn_mask=build_block_diag_mask(sid, causal=causal))
+    assert torch.allclose(sparse[:, :, :length], dense[:, :, :length], atol=1e-5)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_block_sparse_matches_dense_with_same_sparsity_mask(causal: bool) -> None:
+    torch.manual_seed(1)
+    s, w, g = 512, 64, 4
+    q, k, v = (torch.randn(1, 2, s, 8) for _ in range(3))
+    sid = _seq_id_row([150, 3, 200, 90, 40], s)
+
+    sparse = tiled_local_global_attention(q, k, v, seq_id=sid, block_size=w, num_global_tokens=g, causal=causal)
+    ref = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=_reference_local_global_mask(sid, w=w, g=g, causal=causal)
+    )
+    assert torch.allclose(sparse, ref, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graphs need a CUDA device")
+def test_cuda_graph_runner_captures_optimizer_step() -> None:
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    model = ProtocolTransformer(d_model=64, n_heads=4, n_layers=2, d_ff=128).to(dev)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, capturable=True)
+    seqs = [
+        (torch.randint(4, 200, (n,), dtype=torch.int64), torch.randint(0, 8, (n,), dtype=torch.int64))
+        for n in (30, 50, 70)
+    ]
+    batch = pack_sequence_pairs(seqs, pack_len=128, rows_per_batch=2, attn_mode="dense")[0]
+    runner = CudaGraphStepRunner(model, opt, pack_rows=batch.input_ids.shape[0], pack_len=128, device=dev)
+
+    before = [p.detach().clone() for p in model.parameters()]
+    loss1 = runner.replay_step(batch.to(dev))
+    loss2 = runner.replay_step(batch.to(dev))
+    torch.cuda.synchronize()
+    assert torch.isfinite(torch.tensor([loss1, loss2])).all()
+    assert any(not torch.equal(b, p) for b, p in zip(before, model.parameters()))
 
 
 def test_sequence_packing_and_varlen_no_cross_contamination() -> None:

@@ -305,8 +305,12 @@ def export_python_inputs(
 
 def check_protocols_python_lists(
     py_data: dict[str, Any],
-) -> tuple[list[bool], list[int], list[int], list[list[int]]]:
-    """Plain-Python reference loop checking one protocol at a time over Python lists."""
+) -> tuple[list[bool], list[int], list[int], dict[str, list[Any]]]:
+    """Plain-Python reference loop checking one protocol at a time over Python lists.
+
+    Returns (oks, err_codes, first_err_steps, final_state) where final_state maps each
+    LabStateBatch field (volume, sealed, frozen, reagent_mask, has_tip, tip_mask) to per-protocol values.
+    """
     b = len(py_data["volume"])
     c = len(py_data["volume"][0]) if b > 0 else 0
     t_steps = len(py_data["op"][0]) if b > 0 else 0
@@ -314,7 +318,14 @@ def check_protocols_python_lists(
     oks: list[bool] = []
     errs: list[int] = []
     err_steps: list[int] = []
-    final_vols: list[list[int]] = []
+    final_state: dict[str, list[Any]] = {
+        "volume": [],
+        "sealed": [],
+        "frozen": [],
+        "reagent_mask": [],
+        "has_tip": [],
+        "tip_mask": [],
+    }
 
     uses_src_ops = {
         OP_TRANSFER,
@@ -492,9 +503,14 @@ def check_protocols_python_lists(
         oks.append(e_code == ERR_OK)
         errs.append(e_code)
         err_steps.append(e_step)
-        final_vols.append(vol)
+        final_state["volume"].append(vol)
+        final_state["sealed"].append(sealed)
+        final_state["frozen"].append(frozen)
+        final_state["reagent_mask"].append(rmask)
+        final_state["has_tip"].append(has_tip)
+        final_state["tip_mask"].append(tip_mask)
 
-    return oks, errs, err_steps, final_vols
+    return oks, errs, err_steps, final_state
 
 
 def check_protocols_python(
@@ -504,10 +520,19 @@ def check_protocols_python(
     """Plain-Python reference checker returning a CheckResult matching check_protocols_batched."""
     dev = init_state.device
     py_data = export_python_inputs(init_state, protocols)
-    oks, errs, err_steps, final_vols = check_protocols_python_lists(py_data)
+    oks, errs, err_steps, fs = check_protocols_python_lists(py_data)
 
     final_st = init_state.clone()
-    final_st.volume = torch.tensor(final_vols, dtype=torch.int64, device=dev)
+    if oks:
+        final_st = LabStateBatch(
+            volume=torch.tensor(fs["volume"], dtype=torch.int64, device=dev),
+            capacity=init_state.capacity.clone(),
+            sealed=torch.tensor(fs["sealed"], dtype=torch.bool, device=dev),
+            frozen=torch.tensor(fs["frozen"], dtype=torch.bool, device=dev),
+            reagent_mask=torch.tensor(fs["reagent_mask"], dtype=torch.int64, device=dev),
+            has_tip=torch.tensor(fs["has_tip"], dtype=torch.bool, device=dev),
+            tip_mask=torch.tensor(fs["tip_mask"], dtype=torch.int64, device=dev),
+        )
     return CheckResult(
         ok=torch.tensor(oks, dtype=torch.bool, device=dev),
         err_code=torch.tensor(errs, dtype=torch.int64, device=dev),

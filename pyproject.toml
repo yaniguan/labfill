@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Yani Guan" }]
 dependencies = [
-    "torch>=2.2",
+    "torch>=2.5",  # nested_tensor_from_jagged SDPA and FlexAttention
     "numpy>=1.26",
 ]
 

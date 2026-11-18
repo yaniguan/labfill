@@ -73,7 +73,7 @@ def generate_protocol_sequences(
         lbls = [0]
         words = ["BOS"]
 
-        # Choose one optional corrupted step region in ~60% of protocols
+        # Choose one corrupted step region in 80% of protocols (every i with i % 5 != 0)
         has_err = (i % 5) != 0
         err_cls = int((i % (NUM_ERROR_CLASSES - 1)) + 1) if has_err else 0
         err_pos = int(rng.integers(1, max(seq_len - 2, 2)))
@@ -447,6 +447,15 @@ def tiled_local_global_attention(
     sid_q = sid_blocks.reshape(b * n_blk, w)
 
     same_seq = (sid_q.unsqueeze(2) == sid_kv.unsqueeze(1)) & (sid_q.unsqueeze(2) > 0)
+
+    # Drop global slots whose key already sits in the local [prev_blk, cur_blk] window
+    # (blocks 0 and 1), so no key is counted twice in the softmax.
+    blk_start = torch.arange(n_blk, device=q.device) * w
+    glob_dup = torch.arange(g_cnt, device=q.device).unsqueeze(0) >= (blk_start - w).unsqueeze(1)
+    keep_kv = torch.cat(
+        [~glob_dup, torch.ones((n_blk, 2 * w), dtype=torch.bool, device=q.device)], dim=1
+    )  # (N_blk, kv_len)
+    same_seq = same_seq & keep_kv.repeat(b, 1).unsqueeze(1)
 
     if causal:
         pos_row = torch.arange(s, device=q.device).unsqueeze(0).expand(b, s)
@@ -929,6 +938,27 @@ def _execute_timed_batches(
     )
 
 
+def _failed_row(config_name: str, exc: Exception) -> AblationRow:
+    """Record a config that raised instead of aborting the whole ablation."""
+    short_err = (str(exc).splitlines() or [""])[0][:120]
+    return AblationRow(
+        config=config_name,
+        status=f"failed ({type(exc).__name__})",
+        real_tokens_per_sec=0.0,
+        useful_token_fraction=0.0,
+        step_time_ms=0.0,
+        data_wait_ms=0.0,
+        compute_ms=0.0,
+        data_wait_fraction=0.0,
+        useful_tflops_per_sec=0.0,
+        executed_tflops_per_sec=0.0,
+        mfu="N/A",
+        speedup_vs_baseline=0.0,
+        final_loss=float("nan"),
+        notes=short_err,
+    )
+
+
 def _collate_pack_top(pairs: list[tuple[Tensor, Tensor]]) -> PreparedBatch:
     """Top-level picklable collate function for multiprocessing DataLoader."""
     return collate_pack_for_dataloader(pairs, pack_len=512)
@@ -1059,25 +1089,7 @@ def run_fill_gpu_ablation(
         )
         rows.append(row_f)
     except Exception as exc:
-        short_err = str(exc).splitlines()[0][:120]
-        rows.append(
-            AblationRow(
-                config="f_packed_torch_compile",
-                status=f"failed ({type(exc).__name__})",
-                real_tokens_per_sec=0.0,
-                useful_token_fraction=0.0,
-                step_time_ms=0.0,
-                data_wait_ms=0.0,
-                compute_ms=0.0,
-                data_wait_fraction=0.0,
-                useful_tflops_per_sec=0.0,
-                executed_tflops_per_sec=0.0,
-                mfu="N/A",
-                speedup_vs_baseline=0.0,
-                final_loss=float("nan"),
-                notes=short_err,
-            )
-        )
+        rows.append(_failed_row("f_packed_torch_compile", exc))
 
     # (g1) Synchronous slow tokenizer (num_workers=0) vs (g2) Async DataLoader (num_workers=4, prefetch)
     slow_ds = SlowTokenizerDataset(items, slow_work_iters=slow_work_iters)
@@ -1154,50 +1166,54 @@ def run_fill_gpu_ablation(
 
     # (i) CUDA Graphs: run on CUDA if available, else mark "GPU only, not yet measured"
     if dev.type == "cuda":
-        m_i = fresh_model()
-        opt_i = torch.optim.AdamW(m_i.parameters(), lr=3e-4)
-        # Filter full-sized batches for static graph shape
-        full_packed = [b for b in packed_batches if b.input_ids.shape[0] == pack_rows_per_batch]
-        runner = CudaGraphStepRunner(
-            m_i, opt_i, pack_rows=pack_rows_per_batch, pack_len=pack_len, use_bf16=True, device=dev
-        )
-        if full_packed:
-            runner.replay_step(full_packed[0].to(dev, non_blocking=True))
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            real_sum = 0
-            slot_sum = 0
-            u_sum = 0.0
-            e_sum = 0.0
-            loss_v = 0.0
-            for b in full_packed:
-                bd = b.to(dev, non_blocking=True)
-                loss_v = runner.replay_step(bd)
-                uf, ef = count_batch_training_flops(m_i, bd)
-                u_sum += uf
-                e_sum += ef
-                real_sum += bd.real_tokens
-                slot_sum += bd.total_tokens
-            torch.cuda.synchronize()
-            dt = max(time.perf_counter() - t0, 1e-9)
-            rows.append(
-                AblationRow(
-                    config="i_cuda_graphs",
-                    status="ok",
-                    real_tokens_per_sec=real_sum / dt,
-                    useful_token_fraction=real_sum / max(slot_sum, 1),
-                    step_time_ms=1000.0 * dt / len(full_packed),
-                    data_wait_ms=0.0,
-                    compute_ms=1000.0 * dt / len(full_packed),
-                    data_wait_fraction=0.0,
-                    useful_tflops_per_sec=(u_sum / dt) / 1e12,
-                    executed_tflops_per_sec=(e_sum / dt) / 1e12,
-                    mfu=f"{100.0 * (u_sum / dt) / peak_flops:.2f}%" if peak_flops else "N/A",
-                    speedup_vs_baseline=(real_sum / dt) / base_tps,
-                    final_loss=loss_v,
-                    notes="CUDA Graph static replay",
-                )
+        try:
+            m_i = fresh_model()
+            # optimizer.step() runs inside graph capture, which requires capturable=True
+            opt_i = torch.optim.AdamW(m_i.parameters(), lr=3e-4, capturable=True)
+            # Filter full-sized batches for static graph shape
+            full_packed = [b for b in packed_batches if b.input_ids.shape[0] == pack_rows_per_batch]
+            runner = CudaGraphStepRunner(
+                m_i, opt_i, pack_rows=pack_rows_per_batch, pack_len=pack_len, use_bf16=True, device=dev
             )
+            if full_packed:
+                runner.replay_step(full_packed[0].to(dev, non_blocking=True))
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                real_sum = 0
+                slot_sum = 0
+                u_sum = 0.0
+                e_sum = 0.0
+                loss_v = 0.0
+                for b in full_packed:
+                    bd = b.to(dev, non_blocking=True)
+                    loss_v = runner.replay_step(bd)
+                    uf, ef = count_batch_training_flops(m_i, bd)
+                    u_sum += uf
+                    e_sum += ef
+                    real_sum += bd.real_tokens
+                    slot_sum += bd.total_tokens
+                torch.cuda.synchronize()
+                dt = max(time.perf_counter() - t0, 1e-9)
+                rows.append(
+                    AblationRow(
+                        config="i_cuda_graphs",
+                        status="ok",
+                        real_tokens_per_sec=real_sum / dt,
+                        useful_token_fraction=real_sum / max(slot_sum, 1),
+                        step_time_ms=1000.0 * dt / len(full_packed),
+                        data_wait_ms=0.0,
+                        compute_ms=1000.0 * dt / len(full_packed),
+                        data_wait_fraction=0.0,
+                        useful_tflops_per_sec=(u_sum / dt) / 1e12,
+                        executed_tflops_per_sec=(e_sum / dt) / 1e12,
+                        mfu=f"{100.0 * (u_sum / dt) / peak_flops:.2f}%" if peak_flops else "N/A",
+                        speedup_vs_baseline=(real_sum / dt) / base_tps,
+                        final_loss=loss_v,
+                        notes="CUDA Graph static replay",
+                    )
+                )
+        except Exception as exc:
+            rows.append(_failed_row("i_cuda_graphs", exc))
     else:
         rows.append(
             AblationRow(
