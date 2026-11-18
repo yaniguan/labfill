@@ -1,0 +1,35 @@
+{
+  "machine": {
+    "date": "2026-11-18",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpu_cores": 8,
+    "torch_num_threads": 1,
+    "cpu_isa_highlights": [
+      "avx2",
+      "avx512f",
+      "avx512_bf16",
+      "amx_bf16",
+      "amx_tile"
+    ],
+    "python_version": "3.11.16",
+    "torch_version": "2.15.0+cpu",
+    "numpy_version": "2.4.6",
+    "load_avg_1_5_15_at_start": [
+      13.01806640625,
+      20.02734375,
+      28.35986328125
+    ],
+    "cuda_available": false,
+    "gpu_name": "none (CPU only)"
+  },
+  "wall_sec": 0.4,
+  "result": {
+    "batch_plates": 128,
+    "steps_per_plate": 104,
+    "all_valid": true,
+    "volume_conserved": true,
+    "cpu_plates_per_sec": 3823.2,
+    "cpu_time_ms": 33.48,
+    "gpu_plates_per_sec": "not yet measured"
+  }
+}
