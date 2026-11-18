@@ -28,17 +28,28 @@ Status: early. All numbers below were measured on CPU. GPU numbers are **not yet
     pytest
     python recipes/01_batched_validation.py
     python recipes/04_fill_one_gpu.py
-    python benchmarks/run_all.py        # writes benchmarks/results/
+    python benchmarks/run_all.py --fresh   # re-measures; writes benchmarks/results/
 
 ## Measured results (CPU only)
 
 Measured on 2026-11-18: Intel Xeon, 8 cores (AVX-512, AMX-BF16), PyTorch 2.15.0 CPU, Python 3.11.
 The machine was shared and busy (load average about 13-17 on 8 cores at the start of each recipe),
-so these runs use **one PyTorch thread** (`--threads 1`). With 8 threads on the busy machine,
-everything was several times slower; that run is kept in `benchmarks/results/cpu_2026-11-18.md`.
+so these runs use **one PyTorch thread** (`--threads 1`).
+An earlier run with 8 PyTorch threads is kept in `benchmarks/results/cpu_2026-11-18.md`. It started
+at a 1-minute load average of 38.7-45.3, versus 12.9-17.0 for the 1-thread run. Under that load even
+the plain-Python checker, which does not use PyTorch threads, was 4.8x slower at B=1024
+(50,825.0 vs 244,011.1 proto/s) and 3.6x slower at B=16384 (50,326.3 vs 182,366.9 proto/s).
+So the two runs differ mainly in machine load and say nothing about thread scaling; the effect of
+the thread count is not measured. Per-recipe thread counts and load averages are in
+`machine_per_recipe` in each JSON file.
 Full data: `benchmarks/results/cpu_2026-11-18_t1.json`. GPU columns: **not yet measured**.
 
-Reproduce: `python benchmarks/run_all.py --threads 1 --tag t1`
+Reproduce: `python benchmarks/run_all.py --fresh --threads 1 --tag t1`
+
+`benchmarks/results/parts/` (8 threads) and `benchmarks/results/parts_t1/` (1 thread) are the
+cached per-recipe parts behind the published reports. Without `--fresh` the runner reuses them and
+only re-assembles the report; with `--fresh` it re-measures and overwrites them. The runner refuses
+to assemble a report from parts measured with different thread counts.
 
 ### Recipe 1: Batched Protocol Validation (T=24 steps, C=8 containers)
 
@@ -99,8 +110,10 @@ Reproduce: `python benchmarks/run_all.py --threads 1 --tag t1`
 
 - **Stop computing on padding.** Padded batches spend only 30.6% of token slots on real tokens.
   Length buckets raise this to 58.9% (2.09x real tokens/s) and packing to 92.1% (2.60x).
-  The useful-token fraction does not depend on the hardware, so this gain should carry to a GPU.
-- **bf16 autocast on top of packing** gave the largest single jump: 5.42x over the padded fp32
+  The useful-token fraction does not depend on the hardware, so it carries over to a GPU. The
+  tokens/s speedups were measured on CPU only; on a GPU they are not yet measured.
+- **bf16 autocast on top of packing** gave the largest single jump: 2.08x over fp32 packing
+  (8,180.5 vs 3,931.5 real tok/s). Packing and bf16 together give 5.42x over the padded fp32
   baseline. This CPU has AMX-BF16 units; the gain on a GPU will be different and is not yet measured.
 - **Async data loading** cut data-wait time from 25.7% to 10.0% of the step with a slow tokenizer
   (3.28x to 3.69x vs baseline). On a GPU, where compute is faster, data wait is a larger share,
