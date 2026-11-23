@@ -328,6 +328,15 @@ def format_markdown_report(payload: dict[str, Any]) -> str:
     lines.append(f"- **Software**: Python {m['python_version']}, PyTorch {m['torch_version']}, NumPy {m['numpy_version']}")
     lines.append(f"- **GPU**: {m['gpu_name']} (all GPU columns below: `not yet measured`)\n")
 
+    per_recipe = payload.get("machine_per_recipe", {})
+    if per_recipe:
+        lines.append("| Recipe | PyTorch threads | Load avg 1/5/15 min at start |")
+        lines.append("|---|---:|---|")
+        for key, pm in per_recipe.items():
+            load = " / ".join(f"{x:.1f}" for x in pm["load_avg_1_5_15_at_start"])
+            lines.append(f"| `{key}` | {pm['torch_num_threads']} | {load} |")
+        lines.append("")
+
     # Recipe 1
     lines.append("## Recipe 1: Batched Protocol Validation (T=24 steps, C=8 containers)\n")
     lines.append("| Batch B | Plain Python (proto/s) | Batched Torch CPU (proto/s) | Torch CPU / Python | Batched Torch GPU (proto/s) |")
@@ -428,22 +437,51 @@ RECIPES = {
 }
 
 
+def assemble_payload(loaded: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Merge saved recipe parts into one report payload.
+
+    Raises SystemExit if the parts were measured with different torch thread counts,
+    since the report header would otherwise mislabel some of the numbers.
+    """
+    threads = {k: v["machine"]["torch_num_threads"] for k, v in loaded.items()}
+    if len(set(threads.values())) > 1:
+        detail = ", ".join(f"{k}={t}" for k, t in threads.items())
+        raise SystemExit(
+            f"Saved parts disagree on torch_num_threads ({detail}). Refusing to assemble a mixed report. "
+            "Re-run with --fresh, or use a separate --tag for each --threads setting."
+        )
+    payload = {
+        "machine": loaded["recipe1_validation"]["machine"],
+        "machine_per_recipe": {k: v["machine"] for k, v in loaded.items()},
+        "total_benchmark_wall_sec": round(sum(v["wall_sec"] for v in loaded.values()), 2),
+    }
+    payload.update({k: v["result"] for k, v in loaded.items()})
+    return payload
+
+
 def main() -> None:
     """Run each recipe and save its result right away, so a crash does not lose finished parts.
 
-    Usage: python benchmarks/run_all.py [--only recipe4_fill_one_gpu] [--fresh]
+    Saved parts are reused unless --fresh is passed. The repo ships cached parts from the
+    published run, so pass --fresh to actually re-measure.
+
+    Usage: python benchmarks/run_all.py [--only recipe4_fill_one_gpu] [--fresh] [--threads N --tag tN]
     """
     import argparse
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default=None, help="run one recipe key, then assemble if all parts exist")
     ap.add_argument("--fresh", action="store_true", help="ignore saved parts")
+    ap.add_argument("--threads", type=int, default=None, help="torch CPU threads (use 1 on a shared, busy machine)")
+    ap.add_argument("--tag", default="", help="suffix for the parts folder and report names, e.g. t1")
     args = ap.parse_args()
+    if args.threads:
+        torch.set_num_threads(args.threads)
 
     dev = default_device()
     machine = read_cpu_info()
     out_dir = REPO_ROOT / "benchmarks" / "results"
-    part_dir = out_dir / "parts"
+    part_dir = out_dir / ("parts" + (f"_{args.tag}" if args.tag else ""))
     part_dir.mkdir(parents=True, exist_ok=True)
     print(f"Running labfill benchmarks on {machine['cpu_model']} ({machine['cpu_cores']} cores)...")
 
@@ -451,7 +489,11 @@ def main() -> None:
     for i, key in enumerate(keys, 1):
         part = part_dir / f"{key}.json"
         if part.exists() and not args.fresh:
-            print(f"  [{i}/{len(keys)}] {key}: saved part found, skipping")
+            saved_threads = json.loads(part.read_text(encoding="utf-8"))["machine"]["torch_num_threads"]
+            print(
+                f"  [{i}/{len(keys)}] {key}: saved part found (threads={saved_threads}), skipping; "
+                "pass --fresh to re-measure"
+            )
             continue
         title, fn = RECIPES[key]
         print(f"  [{i}/{len(keys)}] {title}...", flush=True)
@@ -464,16 +506,12 @@ def main() -> None:
         print("Not all recipe parts exist yet; run the missing ones.")
         return
     loaded = {k: json.loads(p.read_text(encoding="utf-8")) for k, p in parts.items()}
-    payload = {
-        "machine": loaded["recipe1_validation"]["machine"],
-        "machine_per_recipe": {k: v["machine"] for k, v in loaded.items()},
-        "total_benchmark_wall_sec": round(sum(v["wall_sec"] for v in loaded.values()), 2),
-    }
-    payload.update({k: v["result"] for k, v in loaded.items()})
+    payload = assemble_payload(loaded)
 
     date_tag = payload["machine"]["date"]
-    json_path = out_dir / f"cpu_{date_tag}.json"
-    md_path = out_dir / f"cpu_{date_tag}.md"
+    suffix = f"_{args.tag}" if args.tag else ""
+    json_path = out_dir / f"cpu_{date_tag}{suffix}.json"
+    md_path = out_dir / f"cpu_{date_tag}{suffix}.md"
     json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     md_report = format_markdown_report(payload)
     md_path.write_text(md_report, encoding="utf-8")

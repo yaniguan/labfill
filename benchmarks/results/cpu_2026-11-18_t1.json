@@ -1,0 +1,508 @@
+{
+  "machine": {
+    "date": "2026-11-18",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpu_cores": 8,
+    "torch_num_threads": 1,
+    "cpu_isa_highlights": [
+      "avx2",
+      "avx512f",
+      "avx512_bf16",
+      "amx_bf16",
+      "amx_tile"
+    ],
+    "python_version": "3.11.16",
+    "torch_version": "2.15.0+cpu",
+    "numpy_version": "2.4.6",
+    "load_avg_1_5_15_at_start": [
+      12.93212890625,
+      20.12939453125,
+      28.4375
+    ],
+    "cuda_available": false,
+    "gpu_name": "none (CPU only)"
+  },
+  "machine_per_recipe": {
+    "recipe1_validation": {
+      "date": "2026-11-18",
+      "cpu_model": "Intel(R) Xeon(R) Processor",
+      "cpu_cores": 8,
+      "torch_num_threads": 1,
+      "cpu_isa_highlights": [
+        "avx2",
+        "avx512f",
+        "avx512_bf16",
+        "amx_bf16",
+        "amx_tile"
+      ],
+      "python_version": "3.11.16",
+      "torch_version": "2.15.0+cpu",
+      "numpy_version": "2.4.6",
+      "load_avg_1_5_15_at_start": [
+        12.93212890625,
+        20.12939453125,
+        28.4375
+      ],
+      "cuda_available": false,
+      "gpu_name": "none (CPU only)"
+    },
+    "recipe2_twins_and_factory": {
+      "date": "2026-11-18",
+      "cpu_model": "Intel(R) Xeon(R) Processor",
+      "cpu_cores": 8,
+      "torch_num_threads": 1,
+      "cpu_isa_highlights": [
+        "avx2",
+        "avx512f",
+        "avx512_bf16",
+        "amx_bf16",
+        "amx_tile"
+      ],
+      "python_version": "3.11.16",
+      "torch_version": "2.15.0+cpu",
+      "numpy_version": "2.4.6",
+      "load_avg_1_5_15_at_start": [
+        13.01806640625,
+        20.02734375,
+        28.35986328125
+      ],
+      "cuda_available": false,
+      "gpu_name": "none (CPU only)"
+    },
+    "recipe3_planning_and_scheduling": {
+      "date": "2026-11-18",
+      "cpu_model": "Intel(R) Xeon(R) Processor",
+      "cpu_cores": 8,
+      "torch_num_threads": 1,
+      "cpu_isa_highlights": [
+        "avx2",
+        "avx512f",
+        "avx512_bf16",
+        "amx_bf16",
+        "amx_tile"
+      ],
+      "python_version": "3.11.16",
+      "torch_version": "2.15.0+cpu",
+      "numpy_version": "2.4.6",
+      "load_avg_1_5_15_at_start": [
+        13.01806640625,
+        20.02734375,
+        28.35986328125
+      ],
+      "cuda_available": false,
+      "gpu_name": "none (CPU only)"
+    },
+    "recipe4_fill_one_gpu": {
+      "date": "2026-11-18",
+      "cpu_model": "Intel(R) Xeon(R) Processor",
+      "cpu_cores": 8,
+      "torch_num_threads": 1,
+      "cpu_isa_highlights": [
+        "avx2",
+        "avx512f",
+        "avx512_bf16",
+        "amx_bf16",
+        "amx_tile"
+      ],
+      "python_version": "3.11.16",
+      "torch_version": "2.15.0+cpu",
+      "numpy_version": "2.4.6",
+      "load_avg_1_5_15_at_start": [
+        16.9560546875,
+        22.43408203125,
+        29.7685546875
+      ],
+      "cuda_available": false,
+      "gpu_name": "none (CPU only)"
+    },
+    "recipe5_plate_rehearsal": {
+      "date": "2026-11-18",
+      "cpu_model": "Intel(R) Xeon(R) Processor",
+      "cpu_cores": 8,
+      "torch_num_threads": 1,
+      "cpu_isa_highlights": [
+        "avx2",
+        "avx512f",
+        "avx512_bf16",
+        "amx_bf16",
+        "amx_tile"
+      ],
+      "python_version": "3.11.16",
+      "torch_version": "2.15.0+cpu",
+      "numpy_version": "2.4.6",
+      "load_avg_1_5_15_at_start": [
+        13.01806640625,
+        20.02734375,
+        28.35986328125
+      ],
+      "cuda_available": false,
+      "gpu_name": "none (CPU only)"
+    }
+  },
+  "total_benchmark_wall_sec": 74.22,
+  "recipe1_validation": [
+    {
+      "batch_size": 1,
+      "python_proto_per_sec": 192049.2,
+      "python_ms": 0.005,
+      "torch_cpu_proto_per_sec": 153.3,
+      "torch_cpu_ms": 6.522,
+      "torch_vs_python_ratio": 0.001,
+      "torch_gpu_proto_per_sec": "not yet measured"
+    },
+    {
+      "batch_size": 64,
+      "python_proto_per_sec": 235991.7,
+      "python_ms": 0.271,
+      "torch_cpu_proto_per_sec": 8848.1,
+      "torch_cpu_ms": 7.233,
+      "torch_vs_python_ratio": 0.037,
+      "torch_gpu_proto_per_sec": "not yet measured"
+    },
+    {
+      "batch_size": 1024,
+      "python_proto_per_sec": 244011.1,
+      "python_ms": 4.197,
+      "torch_cpu_proto_per_sec": 104513.6,
+      "torch_cpu_ms": 9.798,
+      "torch_vs_python_ratio": 0.428,
+      "torch_gpu_proto_per_sec": "not yet measured"
+    },
+    {
+      "batch_size": 16384,
+      "python_proto_per_sec": 182366.9,
+      "python_ms": 89.841,
+      "torch_cpu_proto_per_sec": 225851.2,
+      "torch_cpu_ms": 72.543,
+      "torch_vs_python_ratio": 1.238,
+      "torch_gpu_proto_per_sec": "not yet measured"
+    }
+  ],
+  "recipe2_twins_and_factory": {
+    "false_positive_rate_on_valid": 0.0,
+    "generate_check_keep": {
+      "num_candidates": 4096,
+      "kept_fraction": 0.7742,
+      "cpu_candidates_per_sec": 163078.0,
+      "gpu_candidates_per_sec": "not yet measured",
+      "sample_rejection_counts": {
+        "no_tip": 308,
+        "tip_already_on": 166,
+        "bad_pipette": 164,
+        "same_container": 10,
+        "sealed": 13,
+        "not_sealed": 54,
+        "frozen": 75,
+        "not_enough": 32,
+        "bad_temp": 81,
+        "unbalanced": 22
+      }
+    },
+    "twins_and_repair": [
+      {
+        "error_type": "overflow",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 0.6875,
+        "repair_cpu_proto_per_sec": 4840.7,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "wrong_pipette",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "repair_cpu_proto_per_sec": 4548.4,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "missing_tip",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "repair_cpu_proto_per_sec": 4339.0,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "skip_thaw",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "repair_cpu_proto_per_sec": 4496.0,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "sealed_plate",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "repair_cpu_proto_per_sec": 4376.5,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "bad_temp",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "repair_cpu_proto_per_sec": 4752.8,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "swapped_steps",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "repair_cpu_proto_per_sec": 4770.7,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      }
+    ]
+  },
+  "recipe3_planning_and_scheduling": {
+    "dag_beam_search": {
+      "num_steps": 16,
+      "beam_width": 32,
+      "random_topological_valid_rate": 0.0156,
+      "beam_found_valid": true,
+      "beam_cost": 2.55,
+      "candidates_checked": 735,
+      "cpu_time_ms": 43.07,
+      "gpu_time_ms": "not yet measured"
+    },
+    "instrument_scheduling": [
+      {
+        "method": "greedy_arrival",
+        "makespan_sec": 2859.0,
+        "cpu_time_ms": 0.09,
+        "gpu_time_ms": "not yet measured"
+      },
+      {
+        "method": "greedy_lpt",
+        "makespan_sec": 2696.0,
+        "cpu_time_ms": 0.09,
+        "gpu_time_ms": "not yet measured"
+      },
+      {
+        "method": "batched_sa_r256",
+        "makespan_sec": 2688.0,
+        "cpu_time_ms": 43.05,
+        "gpu_time_ms": "not yet measured"
+      }
+    ]
+  },
+  "recipe4_fill_one_gpu": {
+    "ablation": [
+      {
+        "config": "a_padded_baseline",
+        "status": "ok",
+        "real_tokens_per_sec": 1509.9,
+        "useful_token_fraction": 0.3057,
+        "step_time_ms": 652.9,
+        "data_wait_ms": 0.02,
+        "compute_ms": 677.0,
+        "data_wait_fraction": 0.0,
+        "useful_tflops_per_sec": 0.0307,
+        "executed_tflops_per_sec": 0.1001,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 1.0,
+        "final_loss": 0.3578,
+        "gpu_tokens_per_sec": "not yet measured",
+        "notes": ""
+      },
+      {
+        "config": "b_length_bucketed",
+        "status": "ok",
+        "real_tokens_per_sec": 3150.4,
+        "useful_token_fraction": 0.5889,
+        "step_time_ms": 160.6,
+        "data_wait_ms": 0.02,
+        "compute_ms": 276.3,
+        "data_wait_fraction": 0.0001,
+        "useful_tflops_per_sec": 0.0629,
+        "executed_tflops_per_sec": 0.1094,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 2.09,
+        "final_loss": 0.1497,
+        "gpu_tokens_per_sec": "not yet measured",
+        "notes": ""
+      },
+      {
+        "config": "c_sequence_packed",
+        "status": "ok",
+        "real_tokens_per_sec": 3931.5,
+        "useful_token_fraction": 0.9214,
+        "step_time_ms": 237.1,
+        "data_wait_ms": 0.02,
+        "compute_ms": 222.8,
+        "data_wait_fraction": 0.0001,
+        "useful_tflops_per_sec": 0.0799,
+        "executed_tflops_per_sec": 0.1074,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 2.6,
+        "final_loss": 0.3352,
+        "gpu_tokens_per_sec": "not yet measured",
+        "notes": ""
+      },
+      {
+        "config": "d_varlen_nested_sdpa",
+        "status": "ok",
+        "real_tokens_per_sec": 2060.8,
+        "useful_token_fraction": 1.0,
+        "step_time_ms": 446.8,
+        "data_wait_ms": 0.02,
+        "compute_ms": 496.0,
+        "data_wait_fraction": 0.0,
+        "useful_tflops_per_sec": 0.0419,
+        "executed_tflops_per_sec": 0.0419,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 1.36,
+        "final_loss": 0.3578,
+        "gpu_tokens_per_sec": "not yet measured",
+        "notes": "PyTorch jagged nested_tensor + SDPA (is_causal=False)"
+      },
+      {
+        "config": "e_packed_bf16_autocast",
+        "status": "ok",
+        "real_tokens_per_sec": 8180.5,
+        "useful_token_fraction": 0.9214,
+        "step_time_ms": 113.7,
+        "data_wait_ms": 0.03,
+        "compute_ms": 113.3,
+        "data_wait_fraction": 0.0002,
+        "useful_tflops_per_sec": 0.1664,
+        "executed_tflops_per_sec": 0.2249,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 5.42,
+        "final_loss": 0.3352,
+        "gpu_tokens_per_sec": "not yet measured",
+        "notes": ""
+      },
+      {
+        "config": "f_packed_torch_compile",
+        "status": "failed (InductorError)",
+        "real_tokens_per_sec": 0.0,
+        "useful_token_fraction": 0.0,
+        "step_time_ms": 0.0,
+        "data_wait_ms": 0.0,
+        "compute_ms": 0.0,
+        "data_wait_fraction": 0.0,
+        "useful_tflops_per_sec": 0.0,
+        "executed_tflops_per_sec": 0.0,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 0.0,
+        "final_loss": NaN,
+        "notes": "InvalidCxxCompiler: No working C++ compiler found in torch._inductor.config.cpp.cxx: (None, 'g++')",
+        "gpu_tokens_per_sec": "not yet measured"
+      },
+      {
+        "config": "g1_sync_slow_tokenizer",
+        "status": "ok",
+        "real_tokens_per_sec": 4957.9,
+        "useful_token_fraction": 0.785,
+        "step_time_ms": 190.2,
+        "data_wait_ms": 46.45,
+        "compute_ms": 145.0,
+        "data_wait_fraction": 0.2574,
+        "useful_tflops_per_sec": 0.099,
+        "executed_tflops_per_sec": 0.1621,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 3.28,
+        "final_loss": 0.3578,
+        "gpu_tokens_per_sec": "not yet measured",
+        "notes": "num_workers=0 with CPU tokenizer work"
+      },
+      {
+        "config": "g2_async_dataloader",
+        "status": "ok",
+        "real_tokens_per_sec": 5574.6,
+        "useful_token_fraction": 0.785,
+        "step_time_ms": 158.1,
+        "data_wait_ms": 16.32,
+        "compute_ms": 147.2,
+        "data_wait_fraction": 0.0997,
+        "useful_tflops_per_sec": 0.1134,
+        "executed_tflops_per_sec": 0.1788,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 3.69,
+        "final_loss": 0.3578,
+        "gpu_tokens_per_sec": "not yet measured",
+        "notes": "num_workers=2 (spawn), prefetch_factor=2, pin_memory=(cuda)"
+      },
+      {
+        "config": "h_block_sparse_bf16",
+        "status": "ok",
+        "real_tokens_per_sec": 7428.2,
+        "useful_token_fraction": 0.9214,
+        "step_time_ms": 119.1,
+        "data_wait_ms": 0.02,
+        "compute_ms": 127.3,
+        "data_wait_fraction": 0.0002,
+        "useful_tflops_per_sec": 0.1483,
+        "executed_tflops_per_sec": 0.1649,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 4.92,
+        "final_loss": 0.3321,
+        "gpu_tokens_per_sec": "not yet measured",
+        "notes": "Tiled W=64+G=4 (NotImplementedError: FlexAttention does not support backward on CPU.)"
+      },
+      {
+        "config": "i_cuda_graphs",
+        "status": "GPU only, not yet measured",
+        "real_tokens_per_sec": 0.0,
+        "useful_token_fraction": 0.0,
+        "step_time_ms": 0.0,
+        "data_wait_ms": 0.0,
+        "compute_ms": 0.0,
+        "data_wait_fraction": 0.0,
+        "useful_tflops_per_sec": 0.0,
+        "executed_tflops_per_sec": 0.0,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 0.0,
+        "final_loss": NaN,
+        "notes": "GPU only, not yet measured",
+        "gpu_tokens_per_sec": "not yet measured"
+      }
+    ],
+    "profiler_top_cpu_ops": [
+      {
+        "op": "aten::mm",
+        "calls": 34,
+        "self_cpu_ms": 152.381
+      },
+      {
+        "op": "aten::addmm",
+        "calls": 17,
+        "self_cpu_ms": 75.97
+      },
+      {
+        "op": "aten::_scaled_dot_product_flash_attention_for_cpu_backward",
+        "calls": 4,
+        "self_cpu_ms": 29.029
+      },
+      {
+        "op": "aten::_scaled_dot_product_flash_attention_for_cpu",
+        "calls": 4,
+        "self_cpu_ms": 14.266
+      },
+      {
+        "op": "aten::copy_",
+        "calls": 287,
+        "self_cpu_ms": 13.219
+      }
+    ],
+    "flex_attention_probe": {
+      "device": "cpu",
+      "forward_ok": false,
+      "backward_ok": false,
+      "note": "NotImplementedError: FlexAttention does not support backward on CPU. Please set the input requires_grad to False or use another device."
+    }
+  },
+  "recipe5_plate_rehearsal": {
+    "batch_plates": 128,
+    "steps_per_plate": 104,
+    "all_valid": true,
+    "volume_conserved": true,
+    "cpu_plates_per_sec": 3823.2,
+    "cpu_time_ms": 33.48,
+    "gpu_plates_per_sec": "not yet measured"
+  }
+}
