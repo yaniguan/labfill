@@ -1,7 +1,7 @@
 """Recipe 5: Batched 96-well plate liquid-handling rehearsal.
 
 Uses LabLean's row-major well indexing (0-based 0..95 for A1..H12; 1-based label(65) == 'F5'),
-reuses `check_protocols_batched` for validation and volume conservation, and tracks exact
+reuses `check_protocols_batched` for validation (plus a volume-conservation sanity check), and tracks exact
 final (B, 8, 12) well volumes plus approximate solute concentrations across B plates at once.
 """
 
@@ -69,7 +69,9 @@ class PlateRehearsalResult:
     well_volumes_tenths_ul: Tensor  # (B, 8, 12) int64 in 0.1 uL
     well_volumes_ul: Tensor         # (B, 8, 12) float32 in uL
     solute_conc: Tensor             # (B, 8, 12) float32 relative concentration (0..1)
-    volume_conserved: Tensor        # (B,) bool: total container volume unchanged
+    # (B,) bool: total container volume unchanged. Sanity check only: the checker's sole volume
+    # update is a paired -v/+v scatter_add, so this is true by construction.
+    volume_conserved: Tensor
     elapsed_sec: float
 
 
@@ -167,9 +169,9 @@ def make_serial_dilution_plate_batch(
 
     Containers:
       0..95 : 96-well plate (cap 300 uL, start 0 uL)
-      96    : Diluent buffer trough (start 50,000 uL, reagent bit 0)
-      97    : Stock analyte tube (start 10,000 uL, reagent bit 1)
-      98    : Liquid waste trough (start 0 uL, cap 50,000 uL)
+      96    : Diluent buffer trough (start 5,000 uL, cap 10,000 uL, reagent bit 0)
+      97    : Stock analyte tube (start 2,000 uL, cap 5,000 uL, reagent bit 1)
+      98    : Liquid waste trough (start 0 uL, cap 10,000 uL)
     """
     dev = default_device(device)
     g = torch.Generator(device="cpu")

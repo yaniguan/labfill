@@ -54,6 +54,8 @@ labfill/
 | 4 | Fill one GPU | Profile and fix low utilization when training on short, variable-length protocol sequences |
 | 5 | Batched 96-well plate rehearsal | Dry-run many plate protocols and read final well volumes |
 
+In recipe 2, the repair rate counts only edits that keep every transfer and mix step (volumes are reduced only as far as needed to fit); fixes that delete or redirect a transfer are reported separately and not counted.
+
 ## Quickstart
 
     pip install torch --index-url https://download.pytorch.org/whl/cpu
