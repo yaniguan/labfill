@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -28,9 +28,9 @@ def main() -> None:
     print(f"{'Error Type':<18s} | {'Detection Recall':>16s} | {'Exact Primary Code':>18s}")
     print("-" * 60)
     for et in TWIN_ERROR_TYPES:
-        print(
-            f"{et:<18s} | {report.per_error_recall[et]:15.1%} | {report.per_error_primary_code_match[et]:17.1%}"
-        )
+        code_match = report.per_error_primary_code_match.get(et)
+        code_str = f"{code_match:17.1%}" if code_match is not None else f"{'n/a':>17s}"
+        print(f"{et:<18s} | {report.per_error_recall[et]:15.1%} | {code_str}")
 
     # 2. Verifier-gated candidate generation (token-factory pattern)
     gk = generate_check_keep(num_candidates=4096, mutation_rate=0.25, seed=7, device=dev)
@@ -40,16 +40,20 @@ def main() -> None:
     )
     print(f"Rejection breakdown: {gk.rejection_counts}\n")
 
-    # 3. Batched K-edit repair search
+    # 3. Batched K-edit repair search (deleting or redirecting a transfer/mix step is not a repair)
     st_base, pr_base = make_random_valid_protocols(128, seed=11, device=dev)
-    print(f"{'Broken Twin Type':<18s} | {'Repaired (K=24)':>16s} | {'Throughput (proto/s)':>20s}")
-    print("-" * 60)
+    print(
+        f"{'Broken Twin Type':<18s} | {'Repaired (K=24)':>16s} | {'Throughput (proto/s)':>20s} | "
+        f"{'Intent-change only':>18s} | Winning edits"
+    )
+    print("-" * 112)
     for et in TWIN_ERROR_TYPES:
         st_b, pr_b = make_error_twin(st_base, pr_base, et, seed=19)
         rr = batched_repair(st_b, pr_b, num_edits=24)
         print(
             f"{et:<18s} | {rr.num_repaired:4d}/{rr.num_broken:<4d} ({rr.repair_rate:5.1%}) | "
-            f"{rr.protocols_repaired_per_sec:20,.0f}"
+            f"{rr.protocols_repaired_per_sec:20,.0f} | {rr.num_fixed_only_by_intent_change:18d} | "
+            f"{rr.edit_type_counts}"
         )
 
 

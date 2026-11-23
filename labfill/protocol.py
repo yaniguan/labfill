@@ -105,6 +105,9 @@ ROTOR_TOL_TENTHS_UL = 50  # 5.0 uL balance tolerance, matching LabLean
 MAX_RPM = 15000
 MIN_INCUBATE_C = 4
 MAX_INCUBATE_C = 98
+HIGH_TEMP_SEAL_C = 80     # >= 80 C requires sealed container to prevent evaporation
+AMT_SCALE = 10_000        # 1e-5 uL solute tracking unit, matching LabLean amtScale
+CONC_TOL_PERMILLE = 1     # 0.1% concentration tolerance, matching LabLean concTolPermille
 
 
 def default_device(device: str | torch.device | None = None) -> torch.device:
@@ -149,16 +152,40 @@ class LabStateBatch:
     reagent_mask: Tensor | None = None
     has_tip: Tensor | None = None
     tip_mask: Tensor | None = None
+    diluent_mask: int = 0
 
     def __post_init__(self) -> None:
+        if self.volume.ndim != 2:
+            raise ValueError(f"volume must be a 2D (B, C) tensor, got shape {tuple(self.volume.shape)}")
+        if self.volume.dtype != torch.int64:
+            raise ValueError(f"volume must have dtype int64, got {self.volume.dtype}")
         b, c = self.volume.shape
         dev = self.volume.device
+
         if self.reagent_mask is None:
             self.reagent_mask = torch.zeros((b, c), dtype=torch.int64, device=dev)
         if self.has_tip is None:
             self.has_tip = torch.zeros((b,), dtype=torch.bool, device=dev)
         if self.tip_mask is None:
             self.tip_mask = torch.zeros((b,), dtype=torch.int64, device=dev)
+
+        for name, ten, exp_shape, exp_dtype in (
+            ("capacity", self.capacity, (b, c), torch.int64),
+            ("sealed", self.sealed, (b, c), torch.bool),
+            ("frozen", self.frozen, (b, c), torch.bool),
+            ("reagent_mask", self.reagent_mask, (b, c), torch.int64),
+            ("has_tip", self.has_tip, (b,), torch.bool),
+            ("tip_mask", self.tip_mask, (b,), torch.int64),
+        ):
+            if tuple(ten.shape) != exp_shape:
+                raise ValueError(f"{name} shape {tuple(ten.shape)} != expected {exp_shape}")
+            if ten.dtype != exp_dtype:
+                raise ValueError(f"{name} dtype {ten.dtype} != expected {exp_dtype}")
+            if ten.device != dev:
+                raise ValueError(f"{name} device {ten.device} != volume device {dev}")
+
+        if not isinstance(self.diluent_mask, int) or isinstance(self.diluent_mask, bool) or self.diluent_mask < 0:
+            raise ValueError(f"diluent_mask must be a non-negative int bitmask, got {self.diluent_mask!r}")
 
     @property
     def batch_size(self) -> int:
@@ -181,6 +208,7 @@ class LabStateBatch:
             reagent_mask=self.reagent_mask.clone() if self.reagent_mask is not None else None,
             has_tip=self.has_tip.clone() if self.has_tip is not None else None,
             tip_mask=self.tip_mask.clone() if self.tip_mask is not None else None,
+            diluent_mask=self.diluent_mask,
         )
 
     def to(self, device: str | torch.device) -> "LabStateBatch":
@@ -193,6 +221,7 @@ class LabStateBatch:
             reagent_mask=self.reagent_mask.to(dev) if self.reagent_mask is not None else None,
             has_tip=self.has_tip.to(dev) if self.has_tip is not None else None,
             tip_mask=self.tip_mask.to(dev) if self.tip_mask is not None else None,
+            diluent_mask=self.diluent_mask,
         )
 
     def repeat_batch(self, n: int) -> "LabStateBatch":
@@ -205,6 +234,7 @@ class LabStateBatch:
             reagent_mask=self.reagent_mask.repeat_interleave(n, dim=0),
             has_tip=self.has_tip.repeat_interleave(n, dim=0),
             tip_mask=self.tip_mask.repeat_interleave(n, dim=0),
+            diluent_mask=self.diluent_mask,
         )
 
     def index_select(self, idx: Tensor) -> "LabStateBatch":
@@ -216,6 +246,7 @@ class LabStateBatch:
             reagent_mask=self.reagent_mask[idx],
             has_tip=self.has_tip[idx],
             tip_mask=self.tip_mask[idx],
+            diluent_mask=self.diluent_mask,
         )
 
     def as_state_tensor(self) -> Tensor:
@@ -250,12 +281,33 @@ class ProtocolBatch:
     pad_mask: Tensor | None = None
 
     def __post_init__(self) -> None:
+        if self.op.ndim != 2:
+            raise ValueError(f"op must be a 2D (B, T) tensor, got shape {tuple(self.op.shape)}")
+        if self.op.dtype != torch.int64:
+            raise ValueError(f"op must have dtype int64, got {self.op.dtype}")
         b, t = self.op.shape
         dev = self.op.device
         if self.rpm is None:
             self.rpm = torch.zeros((b, t), dtype=torch.int64, device=dev)
         if self.pad_mask is None:
             self.pad_mask = torch.zeros((b, t), dtype=torch.bool, device=dev)
+
+        for name, ten, exp_dtype in (
+            ("src", self.src, torch.int64),
+            ("dst", self.dst, torch.int64),
+            ("vol", self.vol, torch.int64),
+            ("temp", self.temp, torch.int64),
+            ("duration", self.duration, torch.int64),
+            ("pipette", self.pipette, torch.int64),
+            ("rpm", self.rpm, torch.int64),
+            ("pad_mask", self.pad_mask, torch.bool),
+        ):
+            if tuple(ten.shape) != (b, t):
+                raise ValueError(f"{name} shape {tuple(ten.shape)} != expected {(b, t)}")
+            if ten.dtype != exp_dtype:
+                raise ValueError(f"{name} dtype {ten.dtype} != expected {exp_dtype}")
+            if ten.device != dev:
+                raise ValueError(f"{name} device {ten.device} != op device {dev}")
 
     @property
     def batch_size(self) -> int:
@@ -328,12 +380,27 @@ class ProtocolBatch:
         protocols: Sequence[Sequence[dict[str, Any]]],
         max_steps: int | None = None,
         device: str | torch.device | None = None,
+        truncate: bool = False,
     ) -> "ProtocolBatch":
-        """Build a ProtocolBatch from Python lists of step dicts."""
+        """Build a ProtocolBatch from Python lists of step dicts.
+
+        Raises ValueError if any protocol exceeds `max_steps` unless `truncate=True`.
+        """
         dev = default_device(device)
         b = len(protocols)
-        t = max_steps if max_steps is not None else max((len(p) for p in protocols), default=1)
-        t = max(t, 1)
+        if max_steps is not None:
+            if max_steps < 1:
+                raise ValueError(f"max_steps must be >= 1, got {max_steps}")
+            if not truncate:
+                for i, steps in enumerate(protocols):
+                    if len(steps) > max_steps:
+                        raise ValueError(
+                            f"Protocol {i} has {len(steps)} steps, exceeding max_steps={max_steps}; "
+                            "pass truncate=True to allow truncation"
+                        )
+            t = max_steps
+        else:
+            t = max(max((len(p) for p in protocols), default=1), 1)
 
         op = torch.zeros((b, t), dtype=torch.int64)
         src = torch.zeros((b, t), dtype=torch.int64)
@@ -410,6 +477,7 @@ def make_pcr_protocol(
         sealed=torch.zeros((1, len(vols)), dtype=torch.bool, device=dev),
         frozen=torch.tensor([frozen], dtype=torch.bool, device=dev),
         reagent_mask=torch.tensor([rmask], dtype=torch.int64, device=dev),
+        diluent_mask=1 << 0,
     )
 
     steps: list[dict[str, Any]] = []
@@ -550,17 +618,16 @@ def make_random_valid_protocols(
         tracked_vol.scatter_add_(1, s_choices.unsqueeze(1), -v_choices.unsqueeze(1))
         cur += 3
 
-    # Incubate destination container 3
+    # Seal container 3, incubate (temperatures up to 95 C require sealing >= 80 C), and unseal
+    op[:, cur] = OP_SEAL
+    src[:, cur] = 3
+    pad_mask[:, cur] = False
+    cur += 1
+
     op[:, cur] = OP_INCUBATE
     src[:, cur] = 3
     temp[:, cur] = torch.randint(25, 96, (batch_size,), generator=g)
     duration[:, cur] = torch.randint(15, 180, (batch_size,), generator=g)
-    pad_mask[:, cur] = False
-    cur += 1
-
-    # Seal container 3 and unseal it (exercises both seal and unseal!)
-    op[:, cur] = OP_SEAL
-    src[:, cur] = 3
     pad_mask[:, cur] = False
     cur += 1
 
@@ -569,8 +636,8 @@ def make_random_valid_protocols(
     pad_mask[:, cur] = False
     cur += 1
 
-    # Variable length: randomly mask off the last 0..2 optional steps on half the batch
-    # or add a sealed centrifuge spin when well 3 and C-1 are within 5 uL
+    # Variable length: on ~70% of protocols where well 3 and C-1 are within rotor tolerance,
+    # append seal + seal + centrifuge; the rest stay padded
     balanced = (tracked_vol[:, 3] - tracked_vol[:, num_containers - 1]).abs() <= ROTOR_TOL_TENTHS_UL
     do_spin = balanced & (torch.rand((batch_size,), generator=g) > 0.3)
     if cur + 3 <= max_steps:
@@ -634,7 +701,7 @@ def make_random_protocols(
     n_bad = int(corrupt_mask.sum())
     if n_bad > 0:
         idx = corrupt_mask.nonzero(as_tuple=False).squeeze(1)
-        # Inject completely random ops/args at 1..3 step positions per selected protocol
+        # Inject completely random ops/args at 2 step positions per selected protocol (may coincide)
         for _ in range(2):
             step_pos = torch.randint(0, max_steps, (n_bad,), generator=g)
             proto.pad_mask[idx, step_pos] = False

@@ -1,0 +1,64 @@
+{
+  "machine": {
+    "date": "2026-11-18",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpu_cores": 8,
+    "torch_num_threads": 8,
+    "cpu_isa_highlights": [
+      "avx2",
+      "avx512f",
+      "avx512_bf16",
+      "amx_bf16",
+      "amx_tile"
+    ],
+    "python_version": "3.11.16",
+    "torch_version": "2.15.0+cpu",
+    "numpy_version": "2.4.6",
+    "load_avg_1_5_15_at_start": [
+      42.8291015625,
+      50.81689453125,
+      48.16162109375
+    ],
+    "cuda_available": false,
+    "gpu_name": "none (CPU only)"
+  },
+  "wall_sec": 7.72,
+  "result": [
+    {
+      "batch_size": 1,
+      "python_proto_per_sec": 196348.0,
+      "python_ms": 0.005,
+      "torch_cpu_proto_per_sec": 50.6,
+      "torch_cpu_ms": 19.775,
+      "torch_vs_python_ratio": 0.0,
+      "torch_gpu_proto_per_sec": "not yet measured"
+    },
+    {
+      "batch_size": 64,
+      "python_proto_per_sec": 209154.4,
+      "python_ms": 0.306,
+      "torch_cpu_proto_per_sec": 2406.4,
+      "torch_cpu_ms": 26.596,
+      "torch_vs_python_ratio": 0.012,
+      "torch_gpu_proto_per_sec": "not yet measured"
+    },
+    {
+      "batch_size": 1024,
+      "python_proto_per_sec": 50825.0,
+      "python_ms": 20.148,
+      "torch_cpu_proto_per_sec": 15334.1,
+      "torch_cpu_ms": 66.779,
+      "torch_vs_python_ratio": 0.302,
+      "torch_gpu_proto_per_sec": "not yet measured"
+    },
+    {
+      "batch_size": 16384,
+      "python_proto_per_sec": 50326.3,
+      "python_ms": 325.555,
+      "torch_cpu_proto_per_sec": 34128.6,
+      "torch_cpu_ms": 480.067,
+      "torch_vs_python_ratio": 0.678,
+      "torch_gpu_proto_per_sec": "not yet measured"
+    }
+  ]
+}

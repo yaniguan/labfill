@@ -3,15 +3,15 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import datetime as dt
 import json
 import os
-from pathlib import Path
 import platform
 import statistics
 import sys
 import time
+from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +63,8 @@ def read_cpu_info() -> dict[str, Any]:
                         flags_found.append(interesting)
                 break
 
+    load_avg = list(os.getloadavg()) if hasattr(os, "getloadavg") else None
+
     return {
         "date": dt.date.today().isoformat(),
         "cpu_model": cpu_model,
@@ -72,7 +74,7 @@ def read_cpu_info() -> dict[str, Any]:
         "python_version": platform.python_version(),
         "torch_version": torch.__version__,
         "numpy_version": np.__version__,
-        "load_avg_1_5_15_at_start": list(os.getloadavg()),
+        "load_avg_1_5_15_at_start": load_avg,
         "cuda_available": torch.cuda.is_available(),
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none (CPU only)",
     }
@@ -146,24 +148,28 @@ def bench_recipe2(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
             rr = batched_repair(st_b, pr_b, num_edits=24)
             rates.append(rr.protocols_repaired_per_sec)
             rep_frac = rr.repair_rate
+        med_rate = round(statistics.median(rates), 1)
         repair_rows.append(
             {
                 "error_type": et,
                 "detection_recall": recall_rep.per_error_recall[et],
-                "primary_code_match": recall_rep.per_error_primary_code_match[et],
+                "primary_code_match": recall_rep.per_error_primary_code_match.get(et, "n/a"),
                 "repair_rate_k24": round(rep_frac, 4),
-                "repair_cpu_proto_per_sec": round(statistics.median(rates), 1),
-                "repair_gpu_proto_per_sec": "not yet measured",
+                "repair_edit_type_counts": rr.edit_type_counts,
+                "fixed_only_by_intent_change": rr.num_fixed_only_by_intent_change,
+                "repair_cpu_proto_per_sec": med_rate if dev.type == "cpu" else "not yet measured",
+                "repair_gpu_proto_per_sec": med_rate if dev.type == "cuda" else "not yet measured",
             }
         )
 
+    gk_med = round(statistics.median(gk_rates), 1)
     return {
         "false_positive_rate_on_valid": recall_rep.false_positive_rate_on_valid,
         "generate_check_keep": {
             "num_candidates": 4096,
             "kept_fraction": round(gk_kept_frac, 4),
-            "cpu_candidates_per_sec": round(statistics.median(gk_rates), 1),
-            "gpu_candidates_per_sec": "not yet measured",
+            "cpu_candidates_per_sec": gk_med if dev.type == "cpu" else "not yet measured",
+            "gpu_candidates_per_sec": gk_med if dev.type == "cuda" else "not yet measured",
             "sample_rejection_counts": gk_rej,
         },
         "twins_and_repair": repair_rows,
@@ -197,15 +203,17 @@ def bench_recipe3(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
             sr = fn()
             ms_times.append(sr.elapsed_sec * 1000.0)
             best_mk = sr.makespan
+        med_ms = round(statistics.median(ms_times), 2)
         sched_rows.append(
             {
                 "method": name,
                 "makespan_sec": round(best_mk, 1),
-                "cpu_time_ms": round(statistics.median(ms_times), 2),
-                "gpu_time_ms": "not yet measured",
+                "cpu_time_ms": med_ms if dev.type == "cpu" else "not yet measured",
+                "gpu_time_ms": med_ms if dev.type == "cuda" else "not yet measured",
             }
         )
 
+    beam_med = round(statistics.median(beam_times), 2)
     return {
         "dag_beam_search": {
             "num_steps": dag.steps.max_steps,
@@ -214,8 +222,8 @@ def bench_recipe3(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
             "beam_found_valid": plan_res.found,
             "beam_cost": round(plan_res.best_cost, 3),
             "candidates_checked": plan_res.total_candidates_checked,
-            "cpu_time_ms": round(statistics.median(beam_times), 2),
-            "gpu_time_ms": "not yet measured",
+            "cpu_time_ms": beam_med if dev.type == "cpu" else "not yet measured",
+            "gpu_time_ms": beam_med if dev.type == "cuda" else "not yet measured",
         },
         "instrument_scheduling": sched_rows,
     }
@@ -254,7 +262,8 @@ def bench_recipe4(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
         sample = runs[0][c_i]
         if sample.status != "ok":
             d = asdict(sample)
-            d["gpu_tokens_per_sec"] = "not yet measured"
+            d["real_tokens_per_sec"] = "not yet measured" if dev.type == "cuda" else 0.0
+            d["gpu_tokens_per_sec"] = "—" if dev.type == "cuda" else "not yet measured"
             agg_rows.append(d)
             continue
 
@@ -272,7 +281,7 @@ def bench_recipe4(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
             {
                 "config": sample.config,
                 "status": "ok",
-                "real_tokens_per_sec": round(med_tps, 1),
+                "real_tokens_per_sec": round(med_tps, 1) if dev.type == "cpu" else "not yet measured",
                 "useful_token_fraction": round(med_utf, 4),
                 "step_time_ms": round(med_step, 1),
                 "data_wait_ms": round(med_wait_ms, 2),
@@ -283,7 +292,7 @@ def bench_recipe4(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
                 "mfu": sample.mfu,
                 "speedup_vs_baseline": round(med_tps / max(base_tps, 1e-6), 2),
                 "final_loss": round(med_loss, 4),
-                "gpu_tokens_per_sec": "not yet measured",
+                "gpu_tokens_per_sec": round(med_tps, 1) if dev.type == "cuda" else "not yet measured",
                 "notes": sample.notes,
             }
         )
@@ -304,19 +313,34 @@ def bench_recipe5(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
         res = rehearse_96well_protocols(st, pr)
         times.append(res.elapsed_sec)
     med_s = statistics.median(times)
+    rate = round(128.0 / med_s, 1)
+    ms = round(med_s * 1000.0, 2)
     return {
         "batch_plates": 128,
         "steps_per_plate": pr.max_steps,
         "all_valid": bool(res.check.ok.all().item()),
         "volume_conserved": bool(res.volume_conserved.all().item()),
-        "cpu_plates_per_sec": round(128.0 / med_s, 1),
-        "cpu_time_ms": round(med_s * 1000.0, 2),
-        "gpu_plates_per_sec": "not yet measured",
+        "cpu_plates_per_sec": rate if dev.type == "cpu" else "not yet measured",
+        "cpu_time_ms": ms if dev.type == "cpu" else "not yet measured",
+        "gpu_plates_per_sec": rate if dev.type == "cuda" else "not yet measured",
+        "gpu_time_ms": ms if dev.type == "cuda" else "not yet measured",
     }
+
+
+def _fmt_num(val: Any, fmt: str = ",.1f", suffix: str = "") -> str:
+    """Format numeric benchmark cells while preserving string placeholders such as 'not yet measured'."""
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return f"{val:{fmt}}{suffix}"
+    return str(val)
 
 
 def format_markdown_report(payload: dict[str, Any]) -> str:
     m = payload["machine"]
+    gpu_measured = any(
+        isinstance(r.get("torch_gpu_proto_per_sec"), (int, float))
+        and not isinstance(r.get("torch_gpu_proto_per_sec"), bool)
+        for r in payload.get("recipe1_validation", [])
+    )
     lines: list[str] = []
     lines.append(f"# labfill Benchmark Report ({m['date']})\n")
     lines.append("## Machine Info\n")
@@ -324,17 +348,31 @@ def format_markdown_report(payload: dict[str, Any]) -> str:
     lines.append(f"- **CPU**: {m['cpu_model']} ({m['cpu_cores']} cores, PyTorch threads={m['torch_num_threads']})")
     lines.append(f"- **ISA highlights**: `{', '.join(m['cpu_isa_highlights']) or 'standard'}`")
     lines.append(f"- **Software**: Python {m['python_version']}, PyTorch {m['torch_version']}, NumPy {m['numpy_version']}")
-    lines.append(f"- **GPU**: {m['gpu_name']} (all GPU columns below: `not yet measured`)\n")
+    if gpu_measured:
+        lines.append(f"- **GPU**: {m['gpu_name']}\n")
+    else:
+        lines.append(f"- **GPU**: {m['gpu_name']} (all GPU columns below: `not yet measured`)\n")
+
+    per_recipe = payload.get("machine_per_recipe", {})
+    if per_recipe:
+        lines.append("| Recipe | PyTorch threads | Load avg 1/5/15 min at start |")
+        lines.append("|---|---:|---|")
+        for key, pm in per_recipe.items():
+            raw_load = pm.get("load_avg_1_5_15_at_start")
+            load = " / ".join(f"{x:.1f}" for x in raw_load) if raw_load else "N/A"
+            lines.append(f"| `{key}` | {pm['torch_num_threads']} | {load} |")
+        lines.append("")
 
     # Recipe 1
     lines.append("## Recipe 1: Batched Protocol Validation (T=24 steps, C=8 containers)\n")
-    lines.append("| Batch B | Plain Python (proto/s) | Batched Torch CPU (proto/s) | Torch CPU / Python | Batched Torch GPU (proto/s) |")
+    lines.append("| Batch B | Plain Python (proto/s) | Batched Torch CPU (proto/s) | Torch / Python | Batched Torch GPU (proto/s) |")
     lines.append("|---:|---:|---:|---:|---|")
     for r in payload["recipe1_validation"]:
         lines.append(
-            f"| {r['batch_size']} | {r['python_proto_per_sec']:,.1f} | "
-            f"{r['torch_cpu_proto_per_sec']:,.1f} | {r['torch_vs_python_ratio']:.2f}x | "
-            f"{r['torch_gpu_proto_per_sec']} |"
+            f"| {r['batch_size']} | {_fmt_num(r['python_proto_per_sec'], ',.1f')} | "
+            f"{_fmt_num(r['torch_cpu_proto_per_sec'], ',.1f')} | "
+            f"{_fmt_num(r['torch_vs_python_ratio'], '.2f', 'x')} | "
+            f"{_fmt_num(r['torch_gpu_proto_per_sec'], ',.1f')} |"
         )
     lines.append("")
 
@@ -347,15 +385,22 @@ def format_markdown_report(payload: dict[str, Any]) -> str:
     )
     lines.append(
         f"- **Generate-N / Check / Keep (`N={gk['num_candidates']}`)**: kept `{gk['kept_fraction']:.1%}` "
-        f"at `{gk['cpu_candidates_per_sec']:,.1f}` candidates/s on CPU (GPU: `{gk['gpu_candidates_per_sec']}`)\n"
+        f"at `{_fmt_num(gk['cpu_candidates_per_sec'], ',.1f')}` candidates/s on CPU "
+        f"(GPU: `{_fmt_num(gk['gpu_candidates_per_sec'], ',.1f')}`)\n"
     )
-    lines.append("| Error Type | Detection Recall | Repair Rate (K=24) | Repair CPU (proto/s) | Repair GPU (proto/s) |")
-    lines.append("|---|---:|---:|---:|---|")
+    lines.append(
+        "Repair Rate counts only edits that keep every transfer and mix step; deleting or "
+        "redirecting one is reported separately and not counted.\n"
+    )
+    lines.append("| Error Type | Detection Recall | Repair Rate (K=24) | Winning Edits | Intent-Change Only | Repair CPU (proto/s) | Repair GPU (proto/s) |")
+    lines.append("|---|---:|---:|---|---:|---:|---|")
     for tr in r2["twins_and_repair"]:
+        edits = ", ".join(f"{k}: {v}" for k, v in tr.get("repair_edit_type_counts", {}).items()) or "—"
         lines.append(
             f"| `{tr['error_type']}` | {tr['detection_recall']:.1%} | "
-            f"{tr['repair_rate_k24']:.1%} | {tr['repair_cpu_proto_per_sec']:,.1f} | "
-            f"{tr['repair_gpu_proto_per_sec']} |"
+            f"{tr['repair_rate_k24']:.1%} | {edits} | {tr.get('fixed_only_by_intent_change', 'n/a')} | "
+            f"{_fmt_num(tr['repair_cpu_proto_per_sec'], ',.1f')} | "
+            f"{_fmt_num(tr['repair_gpu_proto_per_sec'], ',.1f')} |"
         )
     lines.append("")
 
@@ -367,13 +412,14 @@ def format_markdown_report(payload: dict[str, Any]) -> str:
         f"- **DAG Beam Search (`S={dag['num_steps']}`, `beam={dag['beam_width']}`)**: "
         f"random topological pass rate `{dag['random_topological_valid_rate']:.1%}` vs checker-gated beam "
         f"found=`{dag['beam_found_valid']}` (`{dag['candidates_checked']}` candidates checked in "
-        f"`{dag['cpu_time_ms']:.2f}` ms CPU; GPU: `{dag['gpu_time_ms']}`)\n"
+        f"`{_fmt_num(dag['cpu_time_ms'], '.2f')}` ms CPU; GPU: `{_fmt_num(dag['gpu_time_ms'], '.2f')}`)\n"
     )
     lines.append("| Scheduler (96 jobs, 8 instruments) | Makespan (s) | CPU Time (ms) | GPU Time (ms) |")
     lines.append("|---|---:|---:|---|")
     for sr in r3["instrument_scheduling"]:
         lines.append(
-            f"| `{sr['method']}` | {sr['makespan_sec']:.1f} | {sr['cpu_time_ms']:.2f} | {sr['gpu_time_ms']} |"
+            f"| `{sr['method']}` | {_fmt_num(sr['makespan_sec'], '.1f')} | "
+            f"{_fmt_num(sr['cpu_time_ms'], '.2f')} | {_fmt_num(sr['gpu_time_ms'], '.2f')} |"
         )
     lines.append("")
 
@@ -387,26 +433,27 @@ def format_markdown_report(payload: dict[str, Any]) -> str:
     for row in r4["ablation"]:
         if row["status"] == "ok":
             lines.append(
-                f"| `{row['config']}` | {row['real_tokens_per_sec']:,.1f} | "
-                f"{row['useful_token_fraction'] * 100:.1f}% | {row['step_time_ms']:.1f} | "
-                f"{row['data_wait_fraction'] * 100:.1f}% | {row['speedup_vs_baseline']:.2f}x | "
-                f"{row['mfu']} | {row['gpu_tokens_per_sec']} | {row['notes'] or 'ok'} |"
+                f"| `{row['config']}` | {_fmt_num(row['real_tokens_per_sec'], ',.1f')} | "
+                f"{row['useful_token_fraction'] * 100:.1f}% | {_fmt_num(row['step_time_ms'], '.1f')} | "
+                f"{row['data_wait_fraction'] * 100:.1f}% | {_fmt_num(row['speedup_vs_baseline'], '.2f', 'x')} | "
+                f"{row['mfu']} | {_fmt_num(row['gpu_tokens_per_sec'], ',.1f')} | {row['notes'] or 'ok'} |"
             )
         else:
             lines.append(
                 f"| `{row['config']}` | — | — | — | — | — | {row['mfu']} | "
-                f"{row['gpu_tokens_per_sec']} | `{row['status']}`: {row['notes']} |"
+                f"{_fmt_num(row['gpu_tokens_per_sec'], ',.1f')} | `{row['status']}`: {row['notes']} |"
             )
     lines.append("")
 
     # Recipe 5
     r5 = payload["recipe5_plate_rehearsal"]
     lines.append("## Recipe 5: Batched 96-Well Plate Rehearsal\n")
-    lines.append("| Batch Plates | Steps / Plate | Volume Conserved | CPU (plates/s) | CPU Time (ms) | GPU (plates/s) |")
+    lines.append("| Batch Plates | Steps / Plate | Volume Conserved (sanity check, true by construction) | CPU (plates/s) | CPU Time (ms) | GPU (plates/s) |")
     lines.append("|---:|---:|---|---:|---:|---|")
     lines.append(
         f"| {r5['batch_plates']} | {r5['steps_per_plate']} | `{r5['volume_conserved']}` | "
-        f"{r5['cpu_plates_per_sec']:,.1f} | {r5['cpu_time_ms']:.2f} | {r5['gpu_plates_per_sec']} |"
+        f"{_fmt_num(r5['cpu_plates_per_sec'], ',.1f')} | {_fmt_num(r5['cpu_time_ms'], '.2f')} | "
+        f"{_fmt_num(r5['gpu_plates_per_sec'], ',.1f')} |"
     )
     lines.append("")
     return "\n".join(lines)
@@ -421,22 +468,52 @@ RECIPES = {
 }
 
 
+def assemble_payload(loaded: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Merge saved recipe parts into one report payload.
+
+    Raises SystemExit if the parts were measured with different torch thread counts,
+    since the report header would otherwise mislabel some of the numbers.
+    """
+    threads = {k: v["machine"]["torch_num_threads"] for k, v in loaded.items()}
+    if len(set(threads.values())) > 1:
+        detail = ", ".join(f"{k}={t}" for k, t in threads.items())
+        raise SystemExit(
+            f"Saved parts disagree on torch_num_threads ({detail}). Refusing to assemble a mixed report. "
+            "Re-run with --fresh, or use a separate --tag for each --threads setting."
+        )
+    payload = {
+        "machine": loaded["recipe1_validation"]["machine"],
+        "machine_per_recipe": {k: v["machine"] for k, v in loaded.items()},
+        "total_benchmark_wall_sec": round(sum(v["wall_sec"] for v in loaded.values()), 2),
+    }
+    payload.update({k: v["result"] for k, v in loaded.items()})
+    return payload
+
+
 def main() -> None:
     """Run each recipe and save its result right away, so a crash does not lose finished parts.
 
-    Usage: python benchmarks/run_all.py [--only recipe4_fill_one_gpu] [--fresh]
+    Saved parts are reused unless --fresh is passed. The repo ships cached parts from the
+    published run, so pass --fresh to actually re-measure.
+
+    Usage: python benchmarks/run_all.py [--only recipe4_fill_one_gpu] [--fresh] [--threads N --tag tN]
     """
     import argparse
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default=None, help="run one recipe key, then assemble if all parts exist")
     ap.add_argument("--fresh", action="store_true", help="ignore saved parts")
+    ap.add_argument("--threads", type=int, default=None, help="torch CPU threads (use 1 on a shared, busy machine)")
+    ap.add_argument("--tag", default="", help="suffix for the parts folder and report names, e.g. t1")
+    ap.add_argument("--device", default=None, help="device override, e.g. cpu or cuda")
     args = ap.parse_args()
+    if args.threads:
+        torch.set_num_threads(args.threads)
 
-    dev = default_device()
+    dev = default_device(args.device)
     machine = read_cpu_info()
     out_dir = REPO_ROOT / "benchmarks" / "results"
-    part_dir = out_dir / "parts"
+    part_dir = out_dir / ("parts" + (f"_{args.tag}" if args.tag else ""))
     part_dir.mkdir(parents=True, exist_ok=True)
     print(f"Running labfill benchmarks on {machine['cpu_model']} ({machine['cpu_cores']} cores)...")
 
@@ -444,7 +521,11 @@ def main() -> None:
     for i, key in enumerate(keys, 1):
         part = part_dir / f"{key}.json"
         if part.exists() and not args.fresh:
-            print(f"  [{i}/{len(keys)}] {key}: saved part found, skipping")
+            saved_threads = json.loads(part.read_text(encoding="utf-8"))["machine"]["torch_num_threads"]
+            print(
+                f"  [{i}/{len(keys)}] {key}: saved part found (threads={saved_threads}), skipping; "
+                "pass --fresh to re-measure"
+            )
             continue
         title, fn = RECIPES[key]
         print(f"  [{i}/{len(keys)}] {title}...", flush=True)
@@ -457,16 +538,13 @@ def main() -> None:
         print("Not all recipe parts exist yet; run the missing ones.")
         return
     loaded = {k: json.loads(p.read_text(encoding="utf-8")) for k, p in parts.items()}
-    payload = {
-        "machine": loaded["recipe1_validation"]["machine"],
-        "machine_per_recipe": {k: v["machine"] for k, v in loaded.items()},
-        "total_benchmark_wall_sec": round(sum(v["wall_sec"] for v in loaded.values()), 2),
-    }
-    payload.update({k: v["result"] for k, v in loaded.items()})
+    payload = assemble_payload(loaded)
 
     date_tag = payload["machine"]["date"]
-    json_path = out_dir / f"cpu_{date_tag}.json"
-    md_path = out_dir / f"cpu_{date_tag}.md"
+    prefix = "gpu" if dev.type == "cuda" else "cpu"
+    suffix = f"_{args.tag}" if args.tag else ""
+    json_path = out_dir / f"{prefix}_{date_tag}{suffix}.json"
+    md_path = out_dir / f"{prefix}_{date_tag}{suffix}.md"
     json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     md_report = format_markdown_report(payload)
     md_path.write_text(md_report, encoding="utf-8")

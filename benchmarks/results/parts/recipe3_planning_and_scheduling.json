@@ -1,0 +1,58 @@
+{
+  "machine": {
+    "date": "2026-11-18",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpu_cores": 8,
+    "torch_num_threads": 8,
+    "cpu_isa_highlights": [
+      "avx2",
+      "avx512f",
+      "avx512_bf16",
+      "amx_bf16",
+      "amx_tile"
+    ],
+    "python_version": "3.11.16",
+    "torch_version": "2.15.0+cpu",
+    "numpy_version": "2.4.6",
+    "load_avg_1_5_15_at_start": [
+      45.26708984375,
+      49.6083984375,
+      47.94873046875
+    ],
+    "cuda_available": false,
+    "gpu_name": "none (CPU only)"
+  },
+  "wall_sec": 34.08,
+  "result": {
+    "dag_beam_search": {
+      "num_steps": 16,
+      "beam_width": 32,
+      "random_topological_valid_rate": 0.0156,
+      "beam_found_valid": true,
+      "beam_cost": 2.55,
+      "candidates_checked": 735,
+      "cpu_time_ms": 71.56,
+      "gpu_time_ms": "not yet measured"
+    },
+    "instrument_scheduling": [
+      {
+        "method": "greedy_arrival",
+        "makespan_sec": 2859.0,
+        "cpu_time_ms": 0.09,
+        "gpu_time_ms": "not yet measured"
+      },
+      {
+        "method": "greedy_lpt",
+        "makespan_sec": 2696.0,
+        "cpu_time_ms": 0.1,
+        "gpu_time_ms": "not yet measured"
+      },
+      {
+        "method": "batched_sa_r256",
+        "makespan_sec": 2688.0,
+        "cpu_time_ms": 8659.45,
+        "gpu_time_ms": "not yet measured"
+      }
+    ]
+  }
+}
