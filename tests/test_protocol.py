@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
 import torch
 
 from labfill.protocol import (
@@ -10,6 +13,7 @@ from labfill.protocol import (
     PIP_P20,
     PIP_P200,
     PIP_P1000,
+    LabStateBatch,
     ProtocolBatch,
     make_pcr_protocol,
     make_random_valid_protocols,
@@ -65,3 +69,67 @@ def test_from_steps_list_and_pcr() -> None:
     st_pcr, pr_pcr = make_pcr_protocol()
     assert st_pcr.batch_size == 1
     assert pr_pcr.max_steps > 20
+
+
+def test_from_steps_list_rejects_silent_truncation() -> None:
+    steps = [
+        {"op": OP_PICK_TIP},
+        {"op": OP_TRANSFER, "src": 0, "dst": 1, "vol": 50, "pipette": PIP_P20},
+        {"op": OP_TRANSFER, "src": 0, "dst": 1, "vol": 50, "pipette": PIP_P20},
+    ]
+    with pytest.raises(ValueError, match="exceeding max_steps=2"):
+        ProtocolBatch.from_steps_list([steps], max_steps=2)
+
+    truncated = ProtocolBatch.from_steps_list([steps], max_steps=2, truncate=True)
+    assert truncated.max_steps == 2
+    assert not bool(truncated.pad_mask[0].any().item())
+
+
+def test_labstate_and_protocol_post_init_validation() -> None:
+    with pytest.raises(ValueError, match="capacity shape"):
+        LabStateBatch(
+            volume=torch.zeros((2, 4), dtype=torch.int64),
+            capacity=torch.zeros((2, 3), dtype=torch.int64),
+            sealed=torch.zeros((2, 4), dtype=torch.bool),
+            frozen=torch.zeros((2, 4), dtype=torch.bool),
+        )
+    with pytest.raises(ValueError, match="sealed dtype"):
+        LabStateBatch(
+            volume=torch.zeros((2, 4), dtype=torch.int64),
+            capacity=torch.zeros((2, 4), dtype=torch.int64),
+            sealed=torch.zeros((2, 4), dtype=torch.int64),  # type: ignore[arg-type]
+            frozen=torch.zeros((2, 4), dtype=torch.bool),
+        )
+    with pytest.raises(ValueError, match="diluent_mask"):
+        LabStateBatch(
+            volume=torch.zeros((1, 4), dtype=torch.int64),
+            capacity=torch.zeros((1, 4), dtype=torch.int64),
+            sealed=torch.zeros((1, 4), dtype=torch.bool),
+            frozen=torch.zeros((1, 4), dtype=torch.bool),
+            diluent_mask=-1,
+        )
+
+    z = torch.zeros((2, 5), dtype=torch.int64)
+    with pytest.raises(ValueError, match="vol shape"):
+        ProtocolBatch(
+            op=z,
+            src=z,
+            dst=z,
+            vol=torch.zeros((2, 4), dtype=torch.int64),
+            temp=z,
+            duration=z,
+            pipette=z,
+        )
+
+
+def test_ci_workflow_matrix_and_ruff_config() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    ci_text = (repo_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    pyproject_text = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert "windows-latest" in ci_text
+    assert '"3.11"' in ci_text and '"3.12"' in ci_text
+    assert "ruff check" in ci_text
+    for idx in range(1, 6):
+        assert f"recipes/0{idx}_" in ci_text
+    assert "ruff" in pyproject_text

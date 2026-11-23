@@ -7,16 +7,16 @@ provide zero-dependency tensor baselines when protocols already live on CPU/GPU 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import time
+from collections import deque
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
 from labfill.checker import check_protocols_batched
 from labfill.protocol import (
-    LabStateBatch,
     OP_DROP_TIP,
     OP_INCUBATE,
     OP_PICK_TIP,
@@ -25,6 +25,7 @@ from labfill.protocol import (
     PIP_NONE,
     PIP_P20,
     PIP_P200,
+    LabStateBatch,
     ProtocolBatch,
     default_device,
     ul,
@@ -38,6 +39,50 @@ class StepDAGProblem:
     init_state: LabStateBatch  # (1, C)
     steps: ProtocolBatch       # (1, S)
     edges: list[tuple[int, int]]
+
+    def __post_init__(self) -> None:
+        validate_dag_problem(self)
+
+
+def validate_dag_problem(problem: StepDAGProblem) -> None:
+    """Validate single-instance batch shape, device alignment, edge bounds, and DAG acyclicity."""
+    if problem.init_state.batch_size != 1 or problem.steps.batch_size != 1:
+        raise ValueError(
+            f"StepDAGProblem requires batch_size == 1, got init_state={problem.init_state.batch_size}, "
+            f"steps={problem.steps.batch_size}"
+        )
+    if problem.init_state.device != problem.steps.device:
+        raise ValueError(
+            f"Device mismatch: init_state on {problem.init_state.device} != steps on {problem.steps.device}"
+        )
+    s = problem.steps.max_steps
+    if s < 1:
+        raise ValueError(f"StepDAGProblem must have at least 1 step, got S={s}")
+
+    adj: list[list[int]] = [[] for _ in range(s)]
+    indeg = [0] * s
+    seen_edges: set[tuple[int, int]] = set()
+    for u, v in problem.edges:
+        if not (0 <= u < s and 0 <= v < s):
+            raise ValueError(f"DAG edge ({u}, {v}) out of valid step range 0..{s - 1}")
+        if u == v:
+            raise ValueError(f"Self-loop edge ({u}, {v}) makes StepDAGProblem cyclic")
+        if (u, v) not in seen_edges:
+            seen_edges.add((u, v))
+            adj[u].append(v)
+            indeg[v] += 1
+
+    q: deque[int] = deque(i for i in range(s) if indeg[i] == 0)
+    visited = 0
+    while q:
+        node = q.popleft()
+        visited += 1
+        for nxt in adj[node]:
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                q.append(nxt)
+    if visited != s:
+        raise ValueError("StepDAGProblem edges contain a cycle")
 
 
 @dataclass
@@ -74,6 +119,7 @@ def make_assay_dag_problem(
         sealed=torch.zeros((1, 6), dtype=torch.bool, device=dev),
         frozen=torch.tensor([frozen], dtype=torch.bool, device=dev),
         reagent_mask=torch.tensor([rmask], dtype=torch.int64, device=dev),
+        diluent_mask=1 << 0,
     )
 
     raw_steps = [
@@ -120,7 +166,7 @@ def make_assay_dag_problem(
 
 def _gather_orders(steps_1s: ProtocolBatch, orders: Tensor) -> ProtocolBatch:
     """Build a (B, L) ProtocolBatch by indexing a (1, S) step catalog with `orders` (B, L)."""
-    b, l = orders.shape
+    b, seq_len = orders.shape
     exp = steps_1s.repeat_batch(b)
     return ProtocolBatch(
         op=exp.op.gather(1, orders),
@@ -131,7 +177,7 @@ def _gather_orders(steps_1s: ProtocolBatch, orders: Tensor) -> ProtocolBatch:
         duration=exp.duration.gather(1, orders),
         pipette=exp.pipette.gather(1, orders),
         rpm=exp.rpm.gather(1, orders),
-        pad_mask=torch.zeros((b, l), dtype=torch.bool, device=orders.device),
+        pad_mask=torch.zeros((b, seq_len), dtype=torch.bool, device=orders.device),
     )
 
 
@@ -152,9 +198,12 @@ def sample_random_topological_orders(
 
     Orders come from random-priority greedy selection, which is not uniform over all orderings.
     """
+    validate_dag_problem(problem)
     s = problem.steps.max_steps
     if s > 62:
         raise ValueError("Bitmask DAG sampler supports up to 62 steps")
+    if num_samples < 1:
+        raise ValueError(f"num_samples must be >= 1, got {num_samples}")
     dev = problem.steps.device
     g = torch.Generator(device="cpu")
     g.manual_seed(seed)
@@ -187,11 +236,15 @@ def sample_random_topological_orders(
 def batched_beam_plan_dag(
     problem: StepDAGProblem,
     beam_width: int = 32,
+    require_tip_dropped: bool = False,
 ) -> DAGPlanResult:
     """Batched beam search over DAG step orderings gated at every depth by check_protocols_batched."""
+    validate_dag_problem(problem)
     s = problem.steps.max_steps
     if s > 62:
         raise ValueError("Bitmask DAG planner supports up to 62 steps")
+    if beam_width < 1:
+        raise ValueError(f"beam_width must be >= 1, got {beam_width}")
     dev = problem.steps.device
     if dev.type == "cuda":
         torch.cuda.synchronize()
@@ -216,7 +269,6 @@ def batched_beam_plan_dag(
     total_checked = 0
 
     for _depth in range(s):
-        w = int(beam_orders.shape[0])
         already = (beam_done.unsqueeze(1) & node_bit) != 0
         prereq_ok = (beam_done.unsqueeze(1) & pred_bits.unsqueeze(0)) == pred_bits.unsqueeze(0)
         avail = (~already) & prereq_ok  # (W, S)
@@ -244,7 +296,10 @@ def batched_beam_plan_dag(
         cand_state = problem.init_state.repeat_batch(n_cand)
         chk = check_protocols_batched(cand_state, cand_proto)
 
-        valid_idx = chk.ok.nonzero(as_tuple=False).squeeze(1)
+        ok_mask = chk.ok
+        if require_tip_dropped and _depth == s - 1:
+            ok_mask = ok_mask & (~chk.final_state.has_tip)
+        valid_idx = ok_mask.nonzero(as_tuple=False).squeeze(1)
         if valid_idx.numel() == 0:
             return DAGPlanResult(
                 found=False,
@@ -321,14 +376,20 @@ class ScheduleResult:
     num_steps: int = 0
 
 
-def _normalize_durations(durations: Tensor, num_instruments: int) -> Tensor:
-    """Normalize 1D (J,) or 2D (J, M) durations to float32 (J, M)."""
+def _normalize_durations(
+    durations: Tensor,
+    num_instruments: int,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Normalize 1D (J,) or 2D (J, M) durations to `dtype` (J, M)."""
+    if num_instruments < 1:
+        raise ValueError(f"num_instruments must be >= 1, got {num_instruments}")
     if durations.ndim == 1:
-        return durations.to(torch.float32).unsqueeze(1).expand(-1, num_instruments).contiguous()
+        return durations.to(dtype).unsqueeze(1).expand(-1, num_instruments).contiguous()
     if durations.ndim == 2:
         if durations.shape[1] != num_instruments:
             raise ValueError(f"durations shape {tuple(durations.shape)} != (_, {num_instruments})")
-        return durations.to(torch.float32).contiguous()
+        return durations.to(dtype).contiguous()
     raise ValueError("durations must be 1D (J,) or 2D (J, M)")
 
 
@@ -363,12 +424,12 @@ def compute_loads_and_makespan(
     num_instruments: int,
 ) -> tuple[Tensor, float]:
     """Compute exact (M,) instrument loads and scalar makespan for one (J,) assignment."""
-    d_jm = _normalize_durations(durations, num_instruments)
-    j_idx = torch.arange(d_jm.shape[0], device=d_jm.device)
-    picked = d_jm[j_idx, assignment]
-    loads = torch.zeros((num_instruments,), dtype=torch.float32, device=d_jm.device)
-    loads.scatter_add_(0, assignment, picked)
-    return loads, float(loads.max().item())
+    d_jm64 = _normalize_durations(durations, num_instruments, dtype=torch.float64)
+    j_idx = torch.arange(d_jm64.shape[0], device=d_jm64.device)
+    picked = d_jm64[j_idx, assignment]
+    loads64 = torch.zeros((num_instruments,), dtype=torch.float64, device=d_jm64.device)
+    loads64.scatter_add_(0, assignment, picked)
+    return loads64.to(torch.float32), float(loads64.max().item())
 
 
 def schedule_greedy_list(
@@ -431,7 +492,7 @@ def schedule_batched_sa(
         torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    d_jm = _normalize_durations(durations, num_instruments)
+    d_jm = _normalize_durations(durations, num_instruments, dtype=torch.float64)
     num_jobs = int(d_jm.shape[0])
     r = num_restarts
     m = num_instruments
@@ -439,16 +500,18 @@ def schedule_batched_sa(
     g = torch.Generator(device=dev.type if dev.type == "cuda" else "cpu")
     g.manual_seed(seed)
 
-    # Random initial assignments (R, J)
+    # Random initial assignments (R, J); accumulate loads in float64 to avoid rounding drift
     assign = torch.randint(0, m, (r, num_jobs), generator=g, device=dev)
-    d_rjm = d_jm.t().unsqueeze(0).expand(r, m, num_jobs)  # view: (R, M, J) -> gather on dim=1 or flatten
-    # Flatten (J, M) lookup via linear index j * m + inst
     d_flat = d_jm.reshape(-1)
     j_base = (torch.arange(num_jobs, device=dev) * m).unsqueeze(0)  # (1, J)
-    cur_job_durs = d_flat[(j_base + assign).reshape(-1)].view(r, num_jobs)
 
-    loads = torch.zeros((r, m), dtype=torch.float32, device=dev)
-    loads.scatter_add_(1, assign, cur_job_durs)
+    def _recompute_loads(cur_assign: Tensor) -> Tensor:
+        job_durs = d_flat[(j_base + cur_assign).reshape(-1)].view(r, num_jobs)
+        exact = torch.zeros((r, m), dtype=torch.float64, device=dev)
+        exact.scatter_add_(1, cur_assign, job_durs)
+        return exact
+
+    loads = _recompute_loads(assign)
     cur_ms = loads.max(dim=1).values
 
     best_ms = cur_ms.clone()
@@ -530,6 +593,10 @@ def schedule_batched_sa(
             assign.scatter_(1, j1_2d, torch.where(accept, m2, m1).unsqueeze(1))
             assign.scatter_(1, j2_2d, torch.where(accept, m1, m2).unsqueeze(1))
 
+        if (step + 1) % 64 == 0:
+            loads = _recompute_loads(assign)
+            cur_ms = loads.max(dim=1).values
+
         improved = cur_ms < best_ms
         if bool(improved.any()):
             best_ms = torch.where(improved, cur_ms, best_ms)
@@ -538,7 +605,7 @@ def schedule_batched_sa(
 
     winner = int(best_ms.argmin().item())
     win_assign = best_assign[winner]
-    exact_loads, exact_ms = compute_loads_and_makespan(d_jm, win_assign, m)
+    exact_loads, exact_ms = compute_loads_and_makespan(durations, win_assign, m)
 
     if dev.type == "cuda":
         torch.cuda.synchronize()

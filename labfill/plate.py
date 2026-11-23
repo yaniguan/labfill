@@ -7,23 +7,19 @@ final (B, 8, 12) well volumes plus approximate solute concentrations across B pl
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import time
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
 from labfill.checker import CheckResult, check_protocols_batched
 from labfill.protocol import (
-    ERR_OK,
-    LabStateBatch,
     OP_DROP_TIP,
     OP_MIX,
-    OP_NOOP,
     OP_PICK_TIP,
     OP_TRANSFER,
-    PIP_P20,
-    PIP_P200,
+    LabStateBatch,
     ProtocolBatch,
     default_device,
     pick_pipette_for_vol,
@@ -90,6 +86,18 @@ def rehearse_96well_protocols(
         raise ValueError(f"Expected at least {NUM_WELLS_96} containers for a 96-well plate, got {c}")
 
     dev = init_state.device
+    if initial_solute_conc is not None:
+        if initial_solute_conc.ndim != 2 or initial_solute_conc.shape[0] != b or initial_solute_conc.shape[1] not in (
+            c,
+            NUM_WELLS_96,
+        ):
+            raise ValueError(
+                f"initial_solute_conc shape {tuple(initial_solute_conc.shape)} must match "
+                f"(B, C)=({b}, {c}) or (B, 96)=({b}, {NUM_WELLS_96})"
+            )
+        if b > 0 and bool((initial_solute_conc < 0).any().item()):
+            raise ValueError("initial_solute_conc must be non-negative (>= 0)")
+
     if dev.type == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -99,18 +107,38 @@ def rehearse_96well_protocols(
     final_total = chk.final_state.volume.sum(dim=1)
     conserved = init_total == final_total
 
-    # Track solute mass across transfers for valid protocols to compute final concentrations
-    cur_vol = init_state.volume.to(torch.float32).clone()
+    if b == 0:
+        empty_i = torch.zeros((0, PLATE_ROWS, PLATE_COLS), dtype=torch.int64, device=dev)
+        empty_f = torch.zeros((0, PLATE_ROWS, PLATE_COLS), dtype=torch.float32, device=dev)
+        return PlateRehearsalResult(
+            check=chk,
+            well_volumes_tenths_ul=empty_i,
+            well_volumes_ul=empty_f,
+            solute_conc=empty_f.clone(),
+            volume_conserved=conserved,
+            elapsed_sec=max(time.perf_counter() - t0, 0.0),
+        )
+
+    # Track exact int64 volume alongside float64 solute mass to prevent float32/int64 drift
+    cur_vol = init_state.volume.clone()
     if initial_solute_conc is not None:
-        conc = initial_solute_conc.to(device=dev, dtype=torch.float32)
+        if initial_solute_conc.shape[1] == c:
+            conc64 = initial_solute_conc.to(device=dev, dtype=torch.float64)
+        else:
+            conc64 = torch.zeros((b, c), dtype=torch.float64, device=dev)
+            conc64[:, :NUM_WELLS_96] = initial_solute_conc.to(device=dev, dtype=torch.float64)
+            if c > NUM_WELLS_96 + 1:
+                conc64[:, NUM_WELLS_96 + 1] = 1.0
     else:
-        conc = torch.zeros((b, c), dtype=torch.float32, device=dev)
+        conc64 = torch.zeros((b, c), dtype=torch.float64, device=dev)
         if c > NUM_WELLS_96 + 1:
             # Default convention: reservoir 97 is 1.0x stock solute, 96 is 0.0x diluent
-            conc[:, NUM_WELLS_96 + 1] = 1.0
+            conc64[:, NUM_WELLS_96 + 1] = 1.0
 
-    solute_mass = cur_vol * conc
-    zero_f = torch.zeros((b,), dtype=torch.float32, device=dev)
+    max_conc = conc64.max(dim=1).values.clamp(min=1.0).view(b, 1, 1)
+    solute_mass = cur_vol.to(torch.float64) * conc64
+    zero_i = torch.zeros((b,), dtype=torch.int64, device=dev)
+    zero_f64 = torch.zeros((b,), dtype=torch.float64, device=dev)
 
     op_tb = protocols.op.transpose(0, 1).contiguous()
     src_tb = protocols.src.transpose(0, 1).contiguous()
@@ -119,31 +147,36 @@ def rehearse_96well_protocols(
     pad_tb = protocols.pad_mask.transpose(0, 1).contiguous()
 
     for t in range(protocols.max_steps):
-        # Only step lanes that have not failed at or before t
-        lane_valid = (chk.first_err_step < 0) | (t < chk.first_err_step)
+        # Only step lanes that are completely valid or have not yet reached first_err_step
+        lane_valid = chk.ok | ((chk.first_err_step >= 0) & (t < chk.first_err_step))
         xfer = lane_valid & (~pad_tb[t]) & (op_tb[t] == OP_TRANSFER)
         src_c2 = src_tb[t].clamp(0, c - 1).unsqueeze(1)
         dst_c2 = dst_tb[t].clamp(0, c - 1).unsqueeze(1)
 
         s_v = cur_vol.gather(1, src_c2).squeeze(1)
         s_m = solute_mass.gather(1, src_c2).squeeze(1)
-        v_f = torch.where(xfer, vol_tb[t].to(torch.float32), zero_f)
-        frac = torch.where(s_v > 0.0, (v_f / s_v.clamp(min=1e-6)).clamp(0.0, 1.0), zero_f)
+        v_i = torch.where(xfer, vol_tb[t], zero_i)
+        frac = torch.where(
+            s_v > 0,
+            (v_i.to(torch.float64) / s_v.clamp(min=1).to(torch.float64)).clamp(0.0, 1.0),
+            zero_f64,
+        )
         moved_mass = s_m * frac
 
-        cur_vol.scatter_add_(1, src_c2, -v_f.unsqueeze(1))
-        cur_vol.scatter_add_(1, dst_c2, v_f.unsqueeze(1))
+        cur_vol.scatter_add_(1, src_c2, -v_i.unsqueeze(1))
+        cur_vol.scatter_add_(1, dst_c2, v_i.unsqueeze(1))
         solute_mass.scatter_add_(1, src_c2, -moved_mass.unsqueeze(1))
         solute_mass.scatter_add_(1, dst_c2, moved_mass.unsqueeze(1))
 
     well_vols_tenths = chk.final_state.volume[:, :NUM_WELLS_96].view(b, PLATE_ROWS, PLATE_COLS)
     well_vols_ul = well_vols_tenths.to(torch.float32) / 10.0
     well_mass = solute_mass[:, :NUM_WELLS_96].view(b, PLATE_ROWS, PLATE_COLS)
-    well_conc = torch.where(
+    well_conc64 = torch.where(
         well_vols_tenths > 0,
-        well_mass / well_vols_tenths.to(torch.float32).clamp(min=1.0),
-        torch.zeros_like(well_vols_ul),
+        (well_mass / well_vols_tenths.to(torch.float64).clamp(min=1.0)).clamp(min=0.0),
+        torch.zeros_like(well_mass),
     )
+    well_conc = torch.minimum(well_conc64, max_conc).to(torch.float32)
 
     if dev.type == "cuda":
         torch.cuda.synchronize()
@@ -169,10 +202,15 @@ def make_serial_dilution_plate_batch(
 
     Containers:
       0..95 : 96-well plate (cap 300 uL, start 0 uL)
-      96    : Diluent buffer trough (start 5,000 uL, cap 10,000 uL, reagent bit 0)
+      96    : Diluent buffer trough (start 5,000 uL, cap 10,000 uL, reagent bit 0, diluent)
       97    : Stock analyte tube (start 2,000 uL, cap 5,000 uL, reagent bit 1)
       98    : Liquid waste trough (start 0 uL, cap 10,000 uL)
     """
+    if batch_size < 0:
+        raise ValueError(f"batch_size must be >= 0, got {batch_size}")
+    if not (0 <= num_rows_active <= PLATE_ROWS):
+        raise ValueError(f"num_rows_active must be in 0..{PLATE_ROWS}, got {num_rows_active}")
+
     dev = default_device(device)
     g = torch.Generator(device="cpu")
     g.manual_seed(seed)
@@ -196,49 +234,83 @@ def make_serial_dilution_plate_batch(
         sealed=torch.zeros((batch_size, c_total), dtype=torch.bool),
         frozen=torch.zeros((batch_size, c_total), dtype=torch.bool),
         reagent_mask=rmask,
+        diluent_mask=1 << 0,
     )
 
-    # Vary dilution transfer volume per protocol in batch (e.g. 50 uL, 75 uL, or 100 uL 1:2 dilution)
+    # Vary dilution transfer volume per protocol in batch (50 uL, 75 uL, or 100 uL 1:2 dilution)
     dil_choices = torch.tensor([ul(50.0), ul(75.0), ul(100.0)], dtype=torch.int64)
-    dil_v_per_b = dil_choices[torch.randint(0, 3, (batch_size,), generator=g)].tolist()
+    pip_d_choices = torch.tensor(
+        [pick_pipette_for_vol(int(v)) for v in dil_choices.tolist()], dtype=torch.int64
+    )
+    pip_2d_choices = torch.tensor(
+        [pick_pipette_for_vol(int(2 * v)) for v in dil_choices.tolist()], dtype=torch.int64
+    )
+    choice_idx = torch.randint(0, 3, (batch_size,), generator=g)
+    dv_per_b = dil_choices[choice_idx]          # (B,)
+    pip_d_per_b = pip_d_choices[choice_idx]     # (B,)
+    pip_2d_per_b = pip_2d_choices[choice_idx]   # (B,)
 
+    # Build the shared 1-plate schedule template once and broadcast across B
     n_cols = 8
-    all_protos: list[list[dict[str, int]]] = []
-    for b_i in range(batch_size):
-        dv = int(dil_v_per_b[b_i])
-        pip_d = pick_pipette_for_vol(dv)
-        pip_2d = pick_pipette_for_vol(2 * dv)
-        steps: list[dict[str, int]] = []
+    t_ops: list[int] = []
+    t_srcs: list[int] = []
+    t_dsts: list[int] = []
+    t_vmult: list[int] = []  # 0 = none, 1 = 1*dv (pip_d), 2 = 2*dv (pip_2d)
 
-        # 1. Pre-fill diluent into cols 2..8 for active rows using one clean tip
-        steps.append({"op": OP_PICK_TIP})
-        for r in range(num_rows_active):
-            for col in range(1, n_cols):
-                w = r * PLATE_COLS + col
-                steps.append({"op": OP_TRANSFER, "pipette": pip_d, "src": 96, "dst": w, "vol": dv})
-        steps.append({"op": OP_DROP_TIP})
+    def _add(op_code: int, s: int = 0, d: int = 0, mult: int = 0) -> None:
+        t_ops.append(op_code)
+        t_srcs.append(s)
+        t_dsts.append(d)
+        t_vmult.append(mult)
 
-        # 2. Dispense 2*dv of 1.0x stock into col 1 (index 0) for active rows
-        steps.append({"op": OP_PICK_TIP})
-        for r in range(num_rows_active):
-            w0 = r * PLATE_COLS + 0
-            steps.append({"op": OP_TRANSFER, "pipette": pip_2d, "src": 97, "dst": w0, "vol": 2 * dv})
-        steps.append({"op": OP_DROP_TIP})
+    # 1. Pre-fill diluent into cols 2..8 for active rows using one clean tip
+    _add(OP_PICK_TIP)
+    for r in range(num_rows_active):
+        for col in range(1, n_cols):
+            _add(OP_TRANSFER, s=96, d=r * PLATE_COLS + col, mult=1)
+    _add(OP_DROP_TIP)
 
-        # 3. Serial 2-fold transfers col 0 -> 1 -> ... -> 6 -> 7, then discard dv from col 7 to waste (98)
-        for r in range(num_rows_active):
-            steps.append({"op": OP_PICK_TIP})
-            for col in range(n_cols - 1):
-                w_src = r * PLATE_COLS + col
-                w_dst = r * PLATE_COLS + (col + 1)
-                steps.append({"op": OP_TRANSFER, "pipette": pip_d, "src": w_src, "dst": w_dst, "vol": dv})
-                steps.append({"op": OP_MIX, "pipette": pip_d, "src": w_dst, "vol": dv})
-            # Equalize final well volume by discarding dv from last column into waste
-            w_last = r * PLATE_COLS + (n_cols - 1)
-            steps.append({"op": OP_TRANSFER, "pipette": pip_d, "src": w_last, "dst": 98, "vol": dv})
-            steps.append({"op": OP_DROP_TIP})
+    # 2. Dispense 2*dv of 1.0x stock into col 1 (index 0) for active rows
+    _add(OP_PICK_TIP)
+    for r in range(num_rows_active):
+        _add(OP_TRANSFER, s=97, d=r * PLATE_COLS + 0, mult=2)
+    _add(OP_DROP_TIP)
 
-        all_protos.append(steps)
+    # 3. Serial 2-fold transfers col 0 -> 1 -> ... -> 6 -> 7, then discard dv from col 7 to waste (98)
+    for r in range(num_rows_active):
+        _add(OP_PICK_TIP)
+        for col in range(n_cols - 1):
+            w_src = r * PLATE_COLS + col
+            w_dst = r * PLATE_COLS + (col + 1)
+            _add(OP_TRANSFER, s=w_src, d=w_dst, mult=1)
+            _add(OP_MIX, s=w_dst, d=0, mult=1)
+        _add(OP_TRANSFER, s=r * PLATE_COLS + (n_cols - 1), d=98, mult=1)
+        _add(OP_DROP_TIP)
 
-    proto = ProtocolBatch.from_steps_list(all_protos, device=dev)
+    t_len = len(t_ops)
+    op = torch.tensor(t_ops, dtype=torch.int64).unsqueeze(0).expand(batch_size, t_len).clone()
+    src = torch.tensor(t_srcs, dtype=torch.int64).unsqueeze(0).expand(batch_size, t_len).clone()
+    dst = torch.tensor(t_dsts, dtype=torch.int64).unsqueeze(0).expand(batch_size, t_len).clone()
+    vmult = torch.tensor(t_vmult, dtype=torch.int64).unsqueeze(0)  # (1, T)
+
+    vol_steps = dv_per_b.unsqueeze(1) * vmult
+    zero_bt = torch.zeros((batch_size, t_len), dtype=torch.int64)
+    pip_steps = torch.where(
+        vmult == 1,
+        pip_d_per_b.unsqueeze(1),
+        torch.where(vmult == 2, pip_2d_per_b.unsqueeze(1), zero_bt),
+    )
+    pad_mask = torch.zeros((batch_size, t_len), dtype=torch.bool)
+
+    proto = ProtocolBatch(
+        op=op,
+        src=src,
+        dst=dst,
+        vol=vol_steps,
+        temp=zero_bt.clone(),
+        duration=zero_bt.clone(),
+        pipette=pip_steps,
+        rpm=zero_bt.clone(),
+        pad_mask=pad_mask,
+    ).to(dev)
     return state.to(dev), proto

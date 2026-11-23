@@ -13,6 +13,8 @@ import torch
 from torch import Tensor
 
 from labfill.protocol import (
+    AMT_SCALE,
+    CONC_TOL_PERMILLE,
     ERR_BAD_CONTAINER,
     ERR_BAD_DURATION,
     ERR_BAD_OP,
@@ -30,7 +32,7 @@ from labfill.protocol import (
     ERR_SEALED,
     ERR_TIP_ALREADY_ON,
     ERR_UNBALANCED,
-    LabStateBatch,
+    HIGH_TEMP_SEAL_C,
     MAX_INCUBATE_C,
     MAX_RPM,
     MIN_INCUBATE_C,
@@ -47,8 +49,9 @@ from labfill.protocol import (
     PIP_P2,
     PIP_P1000,
     PIPETTE_RANGES_TENTHS_UL,
-    ProtocolBatch,
     ROTOR_TOL_TENTHS_UL,
+    LabStateBatch,
+    ProtocolBatch,
 )
 
 
@@ -75,22 +78,90 @@ def _pipette_bounds_tensors(device: torch.device) -> tuple[Tensor, Tensor]:
     return mins, maxs
 
 
+def _validate_batch_alignment(init_state: LabStateBatch, protocols: ProtocolBatch) -> None:
+    if init_state.batch_size != protocols.batch_size:
+        raise ValueError(
+            f"Batch size mismatch: init_state.batch_size={init_state.batch_size} != "
+            f"protocols.batch_size={protocols.batch_size}"
+        )
+    if init_state.num_containers < 1:
+        raise ValueError(
+            f"init_state must have at least 1 container (C >= 1), got C={init_state.num_containers}"
+        )
+    if init_state.device != protocols.device:
+        raise ValueError(
+            f"Device mismatch: init_state on {init_state.device} != protocols on {protocols.device}"
+        )
+
+
+def _touch_solute(
+    t_has: Tensor,
+    t_amt: Tensor,
+    t_vol: Tensor,
+    l_amt: Tensor,
+    l_vol: Tensor,
+    active_mask: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    valid_l = active_mask & (l_amt > 0) & (l_vol > 0)
+    lower = (~t_has) | (l_amt * t_vol < t_amt * l_vol)
+    upd = valid_l & lower
+    t_has = torch.where(valid_l, torch.ones_like(t_has), t_has)
+    t_amt = torch.where(upd, l_amt, t_amt)
+    t_vol = torch.where(upd, l_vol, t_vol)
+    return t_has, t_amt, t_vol
+
+
 def check_protocols_batched(
     init_state: LabStateBatch,
     protocols: ProtocolBatch,
 ) -> CheckResult:
     """Check B protocols simultaneously by scanning over T steps with unit-stride B-wide tensor ops."""
+    _validate_batch_alignment(init_state, protocols)
     st = init_state.clone()
     b, c = st.volume.shape
     t_steps = protocols.max_steps
     dev = st.device
 
+    if b == 0:
+        return CheckResult(
+            ok=torch.zeros((0,), dtype=torch.bool, device=dev),
+            err_code=torch.zeros((0,), dtype=torch.int64, device=dev),
+            first_err_step=torch.zeros((0,), dtype=torch.int64, device=dev),
+            final_state=st,
+        )
+
     err_code = torch.zeros((b,), dtype=torch.int64, device=dev)
     first_err_step = torch.full((b,), -1, dtype=torch.int64, device=dev)
     zero_b = torch.zeros((b,), dtype=torch.int64, device=dev)
+    one_b = torch.ones((b,), dtype=torch.int64, device=dev)
     true_b = torch.ones((b,), dtype=torch.bool, device=dev)
     false_b = torch.zeros((b,), dtype=torch.bool, device=dev)
     pip_min, pip_max = _pipette_bounds_tensors(dev)
+
+    # Initial-state well-formedness checks (matching LabLean initChecks prior to step 0)
+    bad_cap = (st.capacity < 0).any(dim=1)
+    bad_neg_vol = (st.volume < 0).any(dim=1)
+    bad_overfull = (st.volume > st.capacity).any(dim=1)
+    bad_masks = (
+        (st.reagent_mask < 0).any(dim=1)
+        | (st.tip_mask < 0)
+        | ((~st.has_tip) & (st.tip_mask != 0))
+    )
+    err_code = torch.where((err_code == 0) & bad_cap, ERR_BAD_CONTAINER, err_code)
+    err_code = torch.where((err_code == 0) & bad_neg_vol, ERR_NOT_ENOUGH, err_code)
+    err_code = torch.where((err_code == 0) & bad_overfull, ERR_OVERFLOW, err_code)
+    err_code = torch.where((err_code == 0) & bad_masks, ERR_CONTAMINATED, err_code)
+    first_err_step = torch.where(err_code != ERR_OK, zero_b, first_err_step)
+
+    # Track non-diluent solute amounts (1e-5 uL integer units) and minimum touched concentration on tip
+    dil_mask = int(st.diluent_mask)
+    has_non_dil = ((st.reagent_mask & (~dil_mask)) != 0) & (st.volume > 0)
+    solute_amt = torch.where(has_non_dil, st.volume * AMT_SCALE, torch.zeros_like(st.volume))
+    tip_has_solute = st.has_tip & ((st.tip_mask & (~dil_mask)) != 0)
+    tip_min_amt = torch.where(
+        tip_has_solute, torch.full((b,), AMT_SCALE, dtype=torch.int64, device=dev), zero_b
+    )
+    tip_min_vol = one_b.clone()
 
     # Transpose (B, T) -> (T, B) contiguous once so per-step vectors have stride 1
     op_tb = protocols.op.transpose(0, 1).contiguous()
@@ -142,6 +213,8 @@ def check_protocols_batched(
         src_frozen = st.frozen.gather(1, src_c2).squeeze(1)
         src_rmask = st.reagent_mask.gather(1, src_c2).squeeze(1)
         dst_rmask = st.reagent_mask.gather(1, dst_c2).squeeze(1)
+        src_amt = solute_amt.gather(1, src_c2).squeeze(1)
+        dst_amt = solute_amt.gather(1, dst_c2).squeeze(1)
 
         pip_c = pip_t.clamp(0, 5)
         valid_pip = (
@@ -177,8 +250,14 @@ def check_protocols_batched(
         step_err = torch.where(
             (step_err == 0) & is_pip_op & src_frozen, ERR_FROZEN, step_err
         )
+        bit_contam = (st.tip_mask & (~src_rmask)) != 0
+        conc_contam = (
+            tip_has_solute
+            & (src_vol > 0)
+            & (1000 * src_amt * tip_min_vol > (1000 + CONC_TOL_PERMILLE) * tip_min_amt * src_vol)
+        )
         step_err = torch.where(
-            (step_err == 0) & is_pip_op & ((st.tip_mask & (~src_rmask)) != 0),
+            (step_err == 0) & is_pip_op & (bit_contam | conc_contam),
             ERR_CONTAMINATED,
             step_err,
         )
@@ -189,7 +268,7 @@ def check_protocols_batched(
             (step_err == 0) & is_xfer & (dst_vol + vol_t > dst_cap), ERR_OVERFLOW, step_err
         )
 
-        # OP_INCUBATE
+        # OP_INCUBATE: valid temp/duration, thawed container, and sealed if >= HIGH_TEMP_SEAL_C
         is_inc = op_t == OP_INCUBATE
         step_err = torch.where(
             (step_err == 0) & is_inc & ((temp_t < MIN_INCUBATE_C) | (temp_t > MAX_INCUBATE_C)),
@@ -198,6 +277,20 @@ def check_protocols_batched(
         )
         step_err = torch.where(
             (step_err == 0) & is_inc & (dur_t <= 0), ERR_BAD_DURATION, step_err
+        )
+        step_err = torch.where(
+            (step_err == 0) & is_inc & src_frozen, ERR_FROZEN, step_err
+        )
+        step_err = torch.where(
+            (step_err == 0) & is_inc & (temp_t >= HIGH_TEMP_SEAL_C) & (~src_sealed),
+            ERR_NOT_SEALED,
+            step_err,
+        )
+
+        # OP_THAW: reject redundant thaw on an already-thawed container
+        is_thaw = op_t == OP_THAW
+        step_err = torch.where(
+            (step_err == 0) & is_thaw & (~src_frozen), ERR_FROZEN, step_err
         )
 
         # OP_SEAL / OP_UNSEAL
@@ -242,7 +335,7 @@ def check_protocols_batched(
         drop_ok = ok_now & is_drop
         xfer_ok = ok_now & is_xfer
         mix_ok = ok_now & is_mix
-        thaw_ok = ok_now & (op_t == OP_THAW)
+        thaw_ok = ok_now & is_thaw
         seal_ok = ok_now & is_seal
         unseal_ok = ok_now & is_unseal
 
@@ -253,9 +346,36 @@ def check_protocols_batched(
         )
         st.tip_mask = torch.where(mix_ok, st.tip_mask | src_rmask, st.tip_mask)
 
+        tip_has_solute = torch.where(pick_ok | drop_ok, false_b, tip_has_solute)
+        tip_min_amt = torch.where(pick_ok | drop_ok, zero_b, tip_min_amt)
+        tip_min_vol = torch.where(pick_ok | drop_ok, one_b, tip_min_vol)
+
+        safe_src_vol = src_vol.clamp(min=1)
+        rem_src_amt = (src_amt * (src_vol - vol_t)) // safe_src_vol
+        moved_amt = (src_amt * vol_t) // safe_src_vol
+        post_dst_amt = dst_amt + moved_amt
+        post_dst_vol = dst_vol + vol_t
+
+        tip_has_solute, tip_min_amt, tip_min_vol = _touch_solute(
+            tip_has_solute, tip_min_amt, tip_min_vol, src_amt, src_vol, xfer_ok
+        )
+        tip_has_solute, tip_min_amt, tip_min_vol = _touch_solute(
+            tip_has_solute, tip_min_amt, tip_min_vol, post_dst_amt, post_dst_vol, xfer_ok
+        )
+        tip_has_solute, tip_min_amt, tip_min_vol = _touch_solute(
+            tip_has_solute, tip_min_amt, tip_min_vol, src_amt, src_vol, mix_ok
+        )
+
         delta_v = torch.where(xfer_ok, vol_t, zero_b).unsqueeze(1)
         st.volume.scatter_add_(1, src_c2, -delta_v)
         st.volume.scatter_add_(1, dst_c2, delta_v)
+
+        solute_amt.scatter_add_(
+            1, src_c2, torch.where(xfer_ok, rem_src_amt - src_amt, zero_b).unsqueeze(1)
+        )
+        solute_amt.scatter_add_(
+            1, dst_c2, torch.where(xfer_ok, moved_amt, zero_b).unsqueeze(1)
+        )
 
         new_dst_rm = torch.where(xfer_ok, dst_rmask | src_rmask, dst_rmask).unsqueeze(1)
         st.reagent_mask.scatter_(1, dst_c2, new_dst_rm)
@@ -281,6 +401,7 @@ def export_python_inputs(
     protocols: ProtocolBatch,
 ) -> dict[str, Any]:
     """Convert tensor batch to plain Python nested lists for pure-Python baseline timing."""
+    _validate_batch_alignment(init_state, protocols)
     st_cpu = init_state.to("cpu")
     pr_cpu = protocols.to("cpu")
     return {
@@ -291,6 +412,7 @@ def export_python_inputs(
         "reagent_mask": st_cpu.reagent_mask.tolist(),
         "has_tip": st_cpu.has_tip.tolist(),
         "tip_mask": st_cpu.tip_mask.tolist(),
+        "diluent_mask": int(st_cpu.diluent_mask),
         "op": pr_cpu.op.tolist(),
         "src": pr_cpu.src.tolist(),
         "dst": pr_cpu.dst.tolist(),
@@ -314,6 +436,7 @@ def check_protocols_python_lists(
     b = len(py_data["volume"])
     c = len(py_data["volume"][0]) if b > 0 else 0
     t_steps = len(py_data["op"][0]) if b > 0 else 0
+    dil_mask = int(py_data.get("diluent_mask", 0))
 
     oks: list[bool] = []
     errs: list[int] = []
@@ -360,7 +483,33 @@ def check_protocols_python_lists(
         e_code = ERR_OK
         e_step = -1
 
-        for t in range(t_steps):
+        # Initial-state well-formedness checks (matching check_protocols_batched)
+        if any(cp < 0 for cp in cap):
+            e_code, e_step = ERR_BAD_CONTAINER, 0
+        elif any(v < 0 for v in vol):
+            e_code, e_step = ERR_NOT_ENOUGH, 0
+        elif any(v > cp for v, cp in zip(vol, cap, strict=True)):
+            e_code, e_step = ERR_OVERFLOW, 0
+        elif any(rm < 0 for rm in rmask) or tip_mask < 0 or ((not has_tip) and tip_mask != 0):
+            e_code, e_step = ERR_CONTAMINATED, 0
+
+        solute_amt = [
+            v * AMT_SCALE if ((rm & (~dil_mask)) != 0 and v > 0) else 0
+            for v, rm in zip(vol, rmask, strict=True)
+        ]
+        tip_has_solute = has_tip and ((tip_mask & (~dil_mask)) != 0)
+        tip_min_amt = AMT_SCALE if tip_has_solute else 0
+        tip_min_vol = 1
+
+        def _py_touch(l_amt: int, l_vol: int) -> None:
+            nonlocal tip_has_solute, tip_min_amt, tip_min_vol
+            if l_amt > 0 and l_vol > 0:
+                if (not tip_has_solute) or (l_amt * tip_min_vol < tip_min_amt * l_vol):
+                    tip_min_amt = l_amt
+                    tip_min_vol = l_vol
+                tip_has_solute = True
+
+        for t in range(t_steps if e_code == ERR_OK else 0):
             if pads_i[t]:
                 continue
             op = ops_i[t]
@@ -386,6 +535,9 @@ def check_protocols_python_lists(
                     break
                 has_tip = True
                 tip_mask = 0
+                tip_has_solute = False
+                tip_min_amt = 0
+                tip_min_vol = 1
 
             elif op == OP_DROP_TIP:
                 if not has_tip:
@@ -393,6 +545,9 @@ def check_protocols_python_lists(
                     break
                 has_tip = False
                 tip_mask = 0
+                tip_has_solute = False
+                tip_min_amt = 0
+                tip_min_vol = 1
 
             elif op == OP_TRANSFER:
                 v = vols_i[t]
@@ -414,7 +569,12 @@ def check_protocols_python_lists(
                 if frozen[s]:
                     e_code, e_step = ERR_FROZEN, t
                     break
-                if (tip_mask & (~rmask[s])) != 0:
+                conc_bad = (
+                    tip_has_solute
+                    and vol[s] > 0
+                    and (1000 * solute_amt[s] * tip_min_vol > (1000 + CONC_TOL_PERMILLE) * tip_min_amt * vol[s])
+                )
+                if (tip_mask & (~rmask[s])) != 0 or conc_bad:
                     e_code, e_step = ERR_CONTAMINATED, t
                     break
                 if vol[s] < v:
@@ -426,8 +586,20 @@ def check_protocols_python_lists(
 
                 old_s_rm = rmask[s]
                 old_d_rm = rmask[d]
+                old_s_vol = vol[s]
+                old_s_amt = solute_amt[s]
+                rem_s_amt = (old_s_amt * (old_s_vol - v)) // old_s_vol
+                moved_amt = (old_s_amt * v) // old_s_vol
+                new_d_amt = solute_amt[d] + moved_amt
+                new_d_vol = vol[d] + v
+
+                _py_touch(old_s_amt, old_s_vol)
+                _py_touch(new_d_amt, new_d_vol)
+
                 vol[s] -= v
-                vol[d] += v
+                vol[d] = new_d_vol
+                solute_amt[s] = rem_s_amt
+                solute_amt[d] = new_d_amt
                 rmask[d] = old_d_rm | old_s_rm
                 tip_mask = tip_mask | old_s_rm | old_d_rm
 
@@ -448,12 +620,18 @@ def check_protocols_python_lists(
                 if frozen[s]:
                     e_code, e_step = ERR_FROZEN, t
                     break
-                if (tip_mask & (~rmask[s])) != 0:
+                conc_bad = (
+                    tip_has_solute
+                    and vol[s] > 0
+                    and (1000 * solute_amt[s] * tip_min_vol > (1000 + CONC_TOL_PERMILLE) * tip_min_amt * vol[s])
+                )
+                if (tip_mask & (~rmask[s])) != 0 or conc_bad:
                     e_code, e_step = ERR_CONTAMINATED, t
                     break
                 if vol[s] < v:
                     e_code, e_step = ERR_NOT_ENOUGH, t
                     break
+                _py_touch(solute_amt[s], vol[s])
                 tip_mask = tip_mask | rmask[s]
 
             elif op == OP_INCUBATE:
@@ -465,8 +643,17 @@ def check_protocols_python_lists(
                 if dur <= 0:
                     e_code, e_step = ERR_BAD_DURATION, t
                     break
+                if frozen[s]:
+                    e_code, e_step = ERR_FROZEN, t
+                    break
+                if tc >= HIGH_TEMP_SEAL_C and (not sealed[s]):
+                    e_code, e_step = ERR_NOT_SEALED, t
+                    break
 
             elif op == OP_THAW:
+                if not frozen[s]:
+                    e_code, e_step = ERR_FROZEN, t
+                    break
                 frozen[s] = False
 
             elif op == OP_SEAL:
@@ -518,21 +705,28 @@ def check_protocols_python(
     protocols: ProtocolBatch,
 ) -> CheckResult:
     """Plain-Python reference checker returning a CheckResult matching check_protocols_batched."""
+    _validate_batch_alignment(init_state, protocols)
     dev = init_state.device
+    if init_state.batch_size == 0:
+        return CheckResult(
+            ok=torch.zeros((0,), dtype=torch.bool, device=dev),
+            err_code=torch.zeros((0,), dtype=torch.int64, device=dev),
+            first_err_step=torch.zeros((0,), dtype=torch.int64, device=dev),
+            final_state=init_state.clone(),
+        )
     py_data = export_python_inputs(init_state, protocols)
     oks, errs, err_steps, fs = check_protocols_python_lists(py_data)
 
-    final_st = init_state.clone()
-    if oks:
-        final_st = LabStateBatch(
-            volume=torch.tensor(fs["volume"], dtype=torch.int64, device=dev),
-            capacity=init_state.capacity.clone(),
-            sealed=torch.tensor(fs["sealed"], dtype=torch.bool, device=dev),
-            frozen=torch.tensor(fs["frozen"], dtype=torch.bool, device=dev),
-            reagent_mask=torch.tensor(fs["reagent_mask"], dtype=torch.int64, device=dev),
-            has_tip=torch.tensor(fs["has_tip"], dtype=torch.bool, device=dev),
-            tip_mask=torch.tensor(fs["tip_mask"], dtype=torch.int64, device=dev),
-        )
+    final_st = LabStateBatch(
+        volume=torch.tensor(fs["volume"], dtype=torch.int64, device=dev),
+        capacity=init_state.capacity.clone(),
+        sealed=torch.tensor(fs["sealed"], dtype=torch.bool, device=dev),
+        frozen=torch.tensor(fs["frozen"], dtype=torch.bool, device=dev),
+        reagent_mask=torch.tensor(fs["reagent_mask"], dtype=torch.int64, device=dev),
+        has_tip=torch.tensor(fs["has_tip"], dtype=torch.bool, device=dev),
+        tip_mask=torch.tensor(fs["tip_mask"], dtype=torch.int64, device=dev),
+        diluent_mask=init_state.diluent_mask,
+    )
     return CheckResult(
         ok=torch.tensor(oks, dtype=torch.bool, device=dev),
         err_code=torch.tensor(errs, dtype=torch.int64, device=dev),

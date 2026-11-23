@@ -14,18 +14,18 @@ Addresses common causes of low single-GPU throughput on science/protocol tasks:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import hashlib
-import math
 import statistics
 import time
+import warnings
+from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 import numpy as np
 import torch
-from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from labfill.protocol import default_device
@@ -210,12 +210,19 @@ def pack_sequence_pairs(
     pack_len: int = 512,
     rows_per_batch: int = 4,
     attn_mode: str = "dense",
+    truncate: bool = False,
 ) -> list[PreparedBatch]:
-    """First-fit decreasing / greedy bin-pack sequences into fixed-length rows of `pack_len`.
+    """First-fit / greedy bin-pack sequences into fixed-length rows of `pack_len`.
 
     Resets `position_ids` to `0..len-1` per packed sequence and tags each sequence with a
     distinct `seq_id >= 1` (`0` = trailing pad) for exact block-diagonal attention masking.
+    Raises ValueError if any sequence exceeds `pack_len` unless `truncate=True`.
     """
+    if pack_len < 1:
+        raise ValueError(f"pack_len must be >= 1, got {pack_len}")
+    if rows_per_batch < 1:
+        raise ValueError(f"rows_per_batch must be >= 1, got {rows_per_batch}")
+
     rows_tok: list[Tensor] = []
     rows_pos: list[Tensor] = []
     rows_lbl: list[Tensor] = []
@@ -226,8 +233,18 @@ def pack_sequence_pairs(
     bins_used: list[int] = []
     bins_next_sid: list[int] = []
 
-    for tok, lbl in pairs:
-        n = min(int(tok.numel()), pack_len)
+    for seq_idx, (tok, lbl) in enumerate(pairs):
+        raw_len = int(tok.numel())
+        if int(lbl.numel()) != raw_len:
+            raise ValueError(
+                f"Sequence {seq_idx} token/label length mismatch: {raw_len} vs {int(lbl.numel())}"
+            )
+        if raw_len > pack_len and not truncate:
+            raise ValueError(
+                f"Sequence {seq_idx} has length {raw_len} > pack_len={pack_len}; "
+                "pass truncate=True to allow truncation"
+            )
+        n = min(raw_len, pack_len) if truncate else raw_len
         tok = tok[:n]
         lbl = lbl[:n]
 
@@ -291,11 +308,21 @@ def collate_pack_for_dataloader(
     return packed_list[0]
 
 
+@dataclass(frozen=True)
+class PackCollate:
+    """Top-level picklable collate callable binding `pack_len` for `spawn` DataLoader workers."""
+
+    pack_len: int = 512
+
+    def __call__(self, pairs: list[tuple[Tensor, Tensor]]) -> PreparedBatch:
+        return collate_pack_for_dataloader(pairs, pack_len=self.pack_len)
+
+
 def collate_varlen_pairs(pairs: list[tuple[Tensor, Tensor]]) -> PreparedBatch:
     """Concatenate sequences into 1D flat tensors + jagged offsets (zero padding)."""
     lens = [int(t.numel()) for t, _ in pairs]
     toks = torch.cat([t for t, _ in pairs], dim=0)
-    lbls = torch.cat([l for _, l in pairs], dim=0)
+    lbls = torch.cat([lbl for _, lbl in pairs], dim=0)
     pos = torch.cat([torch.arange(n, dtype=torch.int64) for n in lens], dim=0)
     offsets = torch.tensor([0] + list(np.cumsum(lens)), dtype=torch.int64)
     total = int(toks.numel())
@@ -384,6 +411,18 @@ def build_block_diag_mask(seq_id: Tensor, causal: bool = False) -> Tensor:
     return safe_mask.unsqueeze(1)  # (B, 1, S, S)
 
 
+def _sequence_start_offsets(seq_id: Tensor) -> Tensor:
+    """Return (B, S) start column index of each token's contiguous packed sequence (`0` on pad)."""
+    b, s = seq_id.shape
+    cols = torch.arange(s, device=seq_id.device).unsqueeze(0).expand(b, s)
+    is_start = seq_id > 0
+    if s > 1:
+        is_start = is_start.clone()
+        is_start[:, 1:] = (seq_id[:, 1:] > 0) & (seq_id[:, 1:] != seq_id[:, :-1])
+    markers = torch.where(is_start, cols, torch.zeros_like(cols))
+    return markers.cummax(dim=1).values
+
+
 def tiled_local_global_attention(
     q: Tensor,
     k: Tensor,
@@ -393,9 +432,11 @@ def tiled_local_global_attention(
     num_global_tokens: int = 4,
     causal: bool = False,
 ) -> Tensor:
-    """Tiled block-sparse attention: each block of W queries attends to [prev_block, cur_block] + G globals.
+    """Tiled block-sparse attention: each block of W queries attends to [prev_block, cur_block] + G per-sequence globals.
 
-    Respects `seq_id` boundaries so packed sequences never leak across sequence borders.
+    Respects `seq_id` boundaries so packed sequences never leak across sequence borders, and gathers
+    the first `G` tokens of each query block's leading packed sequence so packed sequences `seq_id >= 2`
+    retain their own global header context.
     Reduces attention key-value evaluations from S (e.g. 512) to 2*W + G (e.g. 132).
     """
     b, h, s, d = q.shape
@@ -421,9 +462,17 @@ def tiled_local_global_attention(
     k_local = torch.cat([k_padded[:, :, :-1], k_padded[:, :, 1:]], dim=3)  # (B, H, N_blk, 2W, D)
     v_local = torch.cat([v_padded[:, :, :-1], v_padded[:, :, 1:]], dim=3)
 
-    # Global tokens (first G tokens of each row, broadcast to all blocks)
-    k_glob = k[:, :, :g_cnt, :].unsqueeze(2).expand(b, h, n_blk, g_cnt, d)
-    v_glob = v[:, :, :g_cnt, :].unsqueeze(2).expand(b, h, n_blk, g_cnt, d)
+    # Per-sequence global tokens: at most one packed sequence per block started before `cur_blk`
+    # (namely the sequence crossing `blk * W`); any sequence starting inside `cur_blk` already has
+    # its first G tokens inside `k_local`.
+    seq_starts = _sequence_start_offsets(seq_id)         # (B, S)
+    lead_start = seq_starts[:, ::w]                      # (B, N_blk)
+    g_offs = torch.arange(g_cnt, device=q.device).view(1, 1, g_cnt)
+    glob_idx = (lead_start.unsqueeze(2) + g_offs).clamp(0, s - 1)  # (B, N_blk, G)
+
+    idx_4d = glob_idx.view(b, 1, n_blk * g_cnt, 1).expand(b, h, n_blk * g_cnt, d)
+    k_glob = k.gather(2, idx_4d).view(b, h, n_blk, g_cnt, d)
+    v_glob = v.gather(2, idx_4d).view(b, h, n_blk, g_cnt, d)
 
     kv_len = 2 * w + g_cnt
     k_win = (
@@ -442,20 +491,20 @@ def tiled_local_global_attention(
     sid_pad0 = torch.zeros((b, 1, w), dtype=seq_id.dtype, device=seq_id.device)
     sid_padded = torch.cat([sid_pad0, sid_blocks], dim=1)
     sid_local = torch.cat([sid_padded[:, :-1], sid_padded[:, 1:]], dim=2)  # (B, N_blk, 2W)
-    sid_glob = seq_id[:, :g_cnt].unsqueeze(1).expand(b, n_blk, g_cnt)
+    sid_glob = seq_id.gather(1, glob_idx.view(b, n_blk * g_cnt)).view(b, n_blk, g_cnt)
     sid_kv = torch.cat([sid_glob, sid_local], dim=2).reshape(b * n_blk, kv_len)
     sid_q = sid_blocks.reshape(b * n_blk, w)
 
     same_seq = (sid_q.unsqueeze(2) == sid_kv.unsqueeze(1)) & (sid_q.unsqueeze(2) > 0)
 
     # Drop global slots whose key already sits in the local [prev_blk, cur_blk] window
-    # (blocks 0 and 1), so no key is counted twice in the softmax.
-    blk_start = torch.arange(n_blk, device=q.device) * w
-    glob_dup = torch.arange(g_cnt, device=q.device).unsqueeze(0) >= (blk_start - w).unsqueeze(1)
+    # so no key is counted twice in the softmax.
+    blk_start = (torch.arange(n_blk, device=q.device) * w).view(1, n_blk, 1)
+    glob_dup = (glob_idx >= (blk_start - w)) & (glob_idx < (blk_start + w))  # (B, N_blk, G)
     keep_kv = torch.cat(
-        [~glob_dup, torch.ones((n_blk, 2 * w), dtype=torch.bool, device=q.device)], dim=1
-    )  # (N_blk, kv_len)
-    same_seq = same_seq & keep_kv.repeat(b, 1).unsqueeze(1)
+        [~glob_dup, torch.ones((b, n_blk, 2 * w), dtype=torch.bool, device=q.device)], dim=2
+    ).reshape(b * n_blk, kv_len)
+    same_seq = same_seq & keep_kv.unsqueeze(1)
 
     if causal:
         pos_row = torch.arange(s, device=q.device).unsqueeze(0).expand(b, s)
@@ -463,7 +512,7 @@ def tiled_local_global_attention(
         pos_pad = torch.full((b, 1, w), s + 1, dtype=torch.int64, device=q.device)
         pos_padded = torch.cat([pos_pad, pos_blocks], dim=1)
         pos_local = torch.cat([pos_padded[:, :-1], pos_padded[:, 1:]], dim=2)
-        pos_glob = pos_row[:, :g_cnt].unsqueeze(1).expand(b, n_blk, g_cnt)
+        pos_glob = glob_idx
         pos_kv = torch.cat([pos_glob, pos_local], dim=2).reshape(b * n_blk, kv_len)
         pos_q = pos_blocks.reshape(b * n_blk, w)
         same_seq = same_seq & (pos_q.unsqueeze(2) >= pos_kv.unsqueeze(1))
@@ -478,13 +527,72 @@ def tiled_local_global_attention(
     return out_blk.view(b, n_blk, h, w, d).permute(0, 2, 1, 3, 4).reshape(b, h, s, d)
 
 
+def flex_local_global_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    seq_id: Tensor,
+    block_size: int = 64,
+    num_global_tokens: int = 4,
+    causal: bool = False,
+) -> Tensor:
+    """PyTorch FlexAttention execution path matching `tiled_local_global_attention` semantics."""
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+    b, _h, s, _d = q.shape
+    w = block_size
+    g_cnt = min(num_global_tokens, w)
+    seq_starts = _sequence_start_offsets(seq_id)
+    dense_fallback = s % w != 0 or s <= 2 * w
+
+    def mask_mod(b_idx: Tensor, _h_idx: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
+        sq = seq_id[b_idx, q_idx]
+        sk = seq_id[b_idx, kv_idx]
+        is_pad_q = sq == 0
+        same = (sq == sk) & (sq > 0)
+        if not dense_fallback:
+            q_blk = q_idx // w
+            kv_blk = kv_idx // w
+            in_win = (kv_blk == q_blk) | (kv_blk == q_blk - 1)
+            is_glob = (kv_idx - seq_starts[b_idx, kv_idx]) < g_cnt
+            same = same & (in_win | is_glob)
+        if causal:
+            same = same & (kv_idx <= q_idx)
+        return torch.where(is_pad_q, q_idx == kv_idx, same)
+
+    bm = create_block_mask(
+        mask_mod,
+        B=b,
+        H=None,
+        Q_LEN=s,
+        KV_LEN=s,
+        device=str(q.device),
+        _compile=False,
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"flex_attention called without torch\.compile\(\).*",
+            category=UserWarning,
+        )
+        return flex_attention(q, k, v, block_mask=bm)
+
+
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int = 256, n_heads: int = 4, d_ff: int = 1024, causal: bool = False) -> None:
+    def __init__(
+        self,
+        d_model: int = 256,
+        n_heads: int = 4,
+        d_ff: int = 1024,
+        causal: bool = False,
+        use_flex_attention: bool = False,
+    ) -> None:
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.causal = causal
+        self.use_flex_attention = use_flex_attention
 
         self.ln1 = nn.LayerNorm(d_model)
         self.qkv = nn.Linear(d_model, 3 * d_model)
@@ -502,6 +610,7 @@ class TransformerBlock(nn.Module):
         attn_mask: Tensor | None = None,
         seq_id: Tensor | None = None,
         block_sparse: bool = False,
+        use_flex: bool = False,
         block_size: int = 64,
     ) -> Tensor:
         b, s, d = x.shape
@@ -510,12 +619,18 @@ class TransformerBlock(nn.Module):
         k = k.view(b, s, self.n_heads, self.d_head).transpose(1, 2)
         v = v.view(b, s, self.n_heads, self.d_head).transpose(1, 2)
 
-        if block_sparse and seq_id is not None:
+        if (use_flex or (block_sparse and self.use_flex_attention)) and seq_id is not None:
+            attn_out = flex_local_global_attention(
+                q, k, v, seq_id=seq_id, block_size=block_size, causal=self.causal
+            )
+        elif block_sparse and seq_id is not None:
             attn_out = tiled_local_global_attention(
                 q, k, v, seq_id=seq_id, block_size=block_size, causal=self.causal
             )
         else:
-            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, is_causal=(self.causal and attn_mask is None)
+            )
 
         x = x + self.out_proj(attn_out.transpose(1, 2).contiguous().view(b, s, d))
         x = x + self.ffn(self.ln2(x))
@@ -524,19 +639,54 @@ class TransformerBlock(nn.Module):
     def forward_varlen(self, x: Tensor, cu_seqlens: Tensor) -> Tensor:
         t_tok, d = x.shape
         q_raw, k_raw, v_raw = self.qkv(self.ln1(x)).chunk(3, dim=-1)
-        # Nested tensors require contiguous storage before transpose(1, 2)
-        q_nt = torch.nested.nested_tensor_from_jagged(
-            q_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
-        ).transpose(1, 2)
-        k_nt = torch.nested.nested_tensor_from_jagged(
-            k_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
-        ).transpose(1, 2)
-        v_nt = torch.nested.nested_tensor_from_jagged(
-            v_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
-        ).transpose(1, 2)
 
-        attn_nt = F.scaled_dot_product_attention(q_nt, k_nt, v_nt, is_causal=self.causal)
-        attn_flat = attn_nt.transpose(1, 2).values().contiguous().view(t_tok, d)
+        if self.causal and x.device.type != "cuda":
+            # PyTorch's CPU math nested_tensor SDPA backend rejects `is_causal=True`;
+            # run exact zero-padding per-segment SDPA over `cu_seqlens` slices on CPU.
+            q_h = q_raw.contiguous().view(t_tok, self.n_heads, self.d_head)
+            k_h = k_raw.contiguous().view(t_tok, self.n_heads, self.d_head)
+            v_h = v_raw.contiguous().view(t_tok, self.n_heads, self.d_head)
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to("cpu").tolist()
+            outs: list[Tensor] = []
+            for q_s, k_s, v_s in zip(
+                q_h.split(lengths, dim=0),
+                k_h.split(lengths, dim=0),
+                v_h.split(lengths, dim=0),
+                strict=True,
+            ):
+                if q_s.shape[0] == 0:
+                    continue
+                seg_out = F.scaled_dot_product_attention(
+                    q_s.transpose(0, 1).unsqueeze(0),
+                    k_s.transpose(0, 1).unsqueeze(0),
+                    v_s.transpose(0, 1).unsqueeze(0),
+                    is_causal=True,
+                )
+                outs.append(seg_out.squeeze(0).transpose(0, 1).contiguous().view(-1, d))
+            attn_flat = torch.cat(outs, dim=0) if outs else x.new_zeros((0, d))
+        else:
+            # Nested tensors require contiguous storage before transpose(1, 2)
+            q_nt = torch.nested.nested_tensor_from_jagged(
+                q_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
+            ).transpose(1, 2)
+            k_nt = torch.nested.nested_tensor_from_jagged(
+                k_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
+            ).transpose(1, 2)
+            v_nt = torch.nested.nested_tensor_from_jagged(
+                v_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
+            ).transpose(1, 2)
+
+            # PyTorch's CPU jagged SDPA internally converts jagged -> strided nested_tensor,
+            # triggering a prototype UserWarning even when inputs already use layout=torch.jagged.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"The PyTorch API of nested tensors is in prototype stage.*",
+                    category=UserWarning,
+                )
+                attn_nt = F.scaled_dot_product_attention(q_nt, k_nt, v_nt, is_causal=self.causal)
+            attn_flat = attn_nt.transpose(1, 2).values().contiguous().view(t_tok, d)
+
         x = x + self.out_proj(attn_flat)
         x = x + self.ffn(self.ln2(x))
         return x
@@ -556,6 +706,7 @@ class ProtocolTransformer(nn.Module):
         num_classes: int = NUM_ERROR_CLASSES,
         causal: bool = False,
         block_size: int = 64,
+        use_flex_attention: bool = False,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -565,12 +716,19 @@ class ProtocolTransformer(nn.Module):
         self.num_classes = num_classes
         self.causal = causal
         self.block_size = block_size
+        self.use_flex_attention = use_flex_attention
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock(d_model=d_model, n_heads=n_heads, d_ff=d_ff, causal=causal)
+                TransformerBlock(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    d_ff=d_ff,
+                    causal=causal,
+                    use_flex_attention=use_flex_attention,
+                )
                 for _ in range(n_layers)
             ]
         )
@@ -594,7 +752,8 @@ class ProtocolTransformer(nn.Module):
                 x = blk.forward_varlen(x, cu_seqlens)
             return self.head(self.ln_f(x))
 
-        block_sparse = mode == "block_sparse"
+        use_flex = mode == "flex_block_sparse"
+        block_sparse = mode in ("block_sparse", "flex_block_sparse")
         attn_mask = None
         if not block_sparse and seq_id is not None:
             attn_mask = build_block_diag_mask(seq_id, causal=self.causal)
@@ -605,6 +764,7 @@ class ProtocolTransformer(nn.Module):
                 attn_mask=attn_mask,
                 seq_id=seq_id,
                 block_sparse=block_sparse,
+                use_flex=use_flex,
                 block_size=self.block_size,
             )
         return self.head(self.ln_f(x))
@@ -624,31 +784,39 @@ def count_batch_training_flops(
     Separates real protocol tokens and true within-sequence attention from wasted pad tokens
     and masked cross-sequence attention entries.
     """
-    l = model.n_layers
+    n_l = model.n_layers
     d = model.d_model
     f = model.d_ff
     c_out = model.num_classes
 
     # Forward linear FLOPs per token: QKV (6 d^2) + Out (2 d^2) + FFN (4 d f) per layer + head (2 d c_out)
-    linear_fwd_per_tok = float(l * (8 * d * d + 4 * d * f) + 2 * d * c_out)
+    linear_fwd_per_tok = float(n_l * (8 * d * d + 4 * d * f) + 2 * d * c_out)
 
     real_toks = float(batch.real_tokens)
-    sum_sq_real = float(sum(s * s for s in batch.seq_lens))
-    useful_fwd = linear_fwd_per_tok * real_toks + float(4 * l * d) * sum_sq_real
+    if model.causal:
+        attn_pairs_real = float(sum(0.5 * s * (s + 1) for s in batch.seq_lens))
+    else:
+        attn_pairs_real = float(sum(s * s for s in batch.seq_lens))
+    useful_fwd = linear_fwd_per_tok * real_toks + float(4 * n_l * d) * attn_pairs_real
 
     if batch.mode == "varlen":
         exec_fwd = useful_fwd
-    elif batch.mode == "block_sparse":
+    elif batch.mode in ("block_sparse", "flex_block_sparse"):
         b_rows, s_len = batch.input_ids.shape
-        eff_kv = min(s_len, 2 * model.block_size + 4)
+        if s_len % model.block_size != 0 or s_len <= 2 * model.block_size:
+            eff_kv = float(s_len)
+        else:
+            eff_kv = float(2 * model.block_size + min(4, model.block_size))
         exec_fwd = linear_fwd_per_tok * float(batch.total_tokens) + float(
-            4 * l * d * b_rows * s_len * eff_kv
-        )
+            4 * n_l * d * b_rows * s_len
+        ) * eff_kv
     else:
         b_rows, s_len = batch.input_ids.shape
-        exec_fwd = linear_fwd_per_tok * float(batch.total_tokens) + float(
-            4 * l * d * b_rows * s_len * s_len
-        )
+        if batch.seq_id is None and model.causal:
+            attn_pairs_exec = 0.5 * float(b_rows) * float(s_len) * float(s_len + 1)
+        else:
+            attn_pairs_exec = float(b_rows * s_len * s_len)
+        exec_fwd = linear_fwd_per_tok * float(batch.total_tokens) + float(4 * n_l * d) * attn_pairs_exec
 
     return 3.0 * useful_fwd, 3.0 * exec_fwd
 
@@ -663,13 +831,24 @@ def probe_flex_attention(device: str | torch.device | None = None) -> dict[str, 
         def local_win(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
             return (q_idx - kv_idx).abs() <= 32
 
-        bm = create_block_mask(local_win, B=None, H=None, Q_LEN=128, KV_LEN=128, device=str(dev))
-        q = torch.randn(2, 4, 128, 32, device=dev, requires_grad=True)
-        out = flex_attention(q, q, q, block_mask=bm)
-        info["forward_ok"] = True
-        out.sum().backward()
-        info["backward_ok"] = True
-        info["note"] = "FlexAttention forward+backward supported"
+        bm = create_block_mask(
+            local_win, B=None, H=None, Q_LEN=128, KV_LEN=128, device=str(dev), _compile=False
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"flex_attention called without torch\.compile\(\).*",
+                category=UserWarning,
+            )
+            q_fwd = torch.randn(2, 4, 128, 32, device=dev, requires_grad=False)
+            _ = flex_attention(q_fwd, q_fwd, q_fwd, block_mask=bm)
+            info["forward_ok"] = True
+
+            q_bwd = q_fwd.detach().clone().requires_grad_(True)
+            out = flex_attention(q_bwd, q_bwd, q_bwd, block_mask=bm)
+            out.sum().backward()
+            info["backward_ok"] = True
+            info["note"] = "FlexAttention forward+backward supported"
     except Exception as exc:
         info["note"] = f"{type(exc).__name__}: {exc}"
     return info
@@ -734,12 +913,19 @@ class CudaGraphStepRunner:
         self._captured = True
 
     def replay_step(self, batch: PreparedBatch) -> float:
+        if tuple(batch.input_ids.shape) != tuple(self.static_input_ids.shape):
+            raise ValueError(
+                f"Batch shape {tuple(batch.input_ids.shape)} != captured static shape "
+                f"{tuple(self.static_input_ids.shape)}"
+            )
         if not self._captured:
             self.capture()
         self.static_input_ids.copy_(batch.input_ids, non_blocking=True)
         self.static_pos_ids.copy_(batch.position_ids, non_blocking=True)
         if batch.seq_id is not None:
             self.static_seq_id.copy_(batch.seq_id, non_blocking=True)
+        else:
+            self.static_seq_id.fill_(1)
         self.static_labels.copy_(batch.labels, non_blocking=True)
         self.graph.replay()
         return float(self.static_loss.item())
@@ -761,6 +947,8 @@ class AblationRow:
     speedup_vs_baseline: float
     final_loss: float
     notes: str = ""
+    real_tokens: int = 0
+    total_tokens: int = 0
 
 
 def run_torch_profiler_summary(
@@ -935,6 +1123,8 @@ def _execute_timed_batches(
         speedup_vs_baseline=1.0,
         final_loss=last_loss,
         notes=notes,
+        real_tokens=total_real,
+        total_tokens=total_slots,
     )
 
 
@@ -959,9 +1149,7 @@ def _failed_row(config_name: str, exc: Exception) -> AblationRow:
     )
 
 
-def _collate_pack_top(pairs: list[tuple[Tensor, Tensor]]) -> PreparedBatch:
-    """Top-level picklable collate function for multiprocessing DataLoader."""
-    return collate_pack_for_dataloader(pairs, pack_len=512)
+_collate_pack_top = PackCollate(pack_len=512)
 
 
 def _worker_init_single_thread(_worker_id: int) -> None:
@@ -984,18 +1172,25 @@ def run_fill_gpu_ablation(
 ) -> tuple[list[AblationRow], list[dict[str, Any]], dict[str, Any]]:
     """Run all Fill-One-GPU toggles and return (rows, profiler_top_ops, flex_probe)."""
     dev = default_device(device)
-    items = generate_protocol_sequences(num_sequences=num_sequences, seed=seed)
+    items = generate_protocol_sequences(
+        num_sequences=num_sequences,
+        min_len=min(8, pack_len),
+        max_len=pack_len,
+        seed=seed,
+    )
     flex_info = probe_flex_attention(dev)
 
-    def fresh_model() -> ProtocolTransformer:
+    def fresh_model(use_flex: bool = False) -> ProtocolTransformer:
         torch.manual_seed(seed)
         return ProtocolTransformer(
+            max_seq_len=max(pack_len, 512),
             d_model=d_model,
             n_heads=n_heads,
             n_layers=n_layers,
             d_ff=4 * d_model,
             causal=False,
             block_size=64,
+            use_flex_attention=use_flex,
         ).to(dev)
 
     rows: list[AblationRow] = []
@@ -1091,14 +1286,16 @@ def run_fill_gpu_ablation(
     except Exception as exc:
         rows.append(_failed_row("f_packed_torch_compile", exc))
 
-    # (g1) Synchronous slow tokenizer (num_workers=0) vs (g2) Async DataLoader (num_workers=4, prefetch)
+    # (g1) Synchronous slow tokenizer (num_workers=0) vs (g2) Async DataLoader (num_workers=2, prefetch)
     slow_ds = SlowTokenizerDataset(items, slow_work_iters=slow_work_iters)
+    pack_collate = PackCollate(pack_len=pack_len)
+    dl_pool_size = max(batch_size, pack_rows_per_batch * 8)
     sync_loader = DataLoader(
         slow_ds,
-        batch_size=batch_size,
+        batch_size=dl_pool_size,
         shuffle=False,
         num_workers=0,
-        collate_fn=_collate_pack_top,
+        collate_fn=pack_collate,
     )
     m_g1 = fresh_model()
     rows.append(
@@ -1116,7 +1313,7 @@ def run_fill_gpu_ablation(
 
     async_loader = DataLoader(
         slow_ds,
-        batch_size=batch_size,
+        batch_size=dl_pool_size,
         shuffle=False,
         num_workers=2,
         prefetch_factor=2,
@@ -1124,7 +1321,7 @@ def run_fill_gpu_ablation(
         persistent_workers=True,
         multiprocessing_context="spawn",
         worker_init_fn=_worker_init_single_thread,
-        collate_fn=_collate_pack_top,
+        collate_fn=pack_collate,
     )
     m_g2 = fresh_model()
     try:
@@ -1145,37 +1342,67 @@ def run_fill_gpu_ablation(
         if getattr(async_loader, "_iterator", None) is not None:
             async_loader._iterator._shutdown_workers()
 
-    # (h) Tiled block-sparse (local window W=64 + 4 global tokens) + BF16
+    # (h) Block-sparse (local window W=64 + 4 per-seq global tokens) + BF16
     sparse_batches = build_batches_from_items(
         items, "block_sparse", pack_len=pack_len, pack_rows_per_batch=pack_rows_per_batch
     )
-    m_h = fresh_model()
-    flex_note = "FlexAttn fwd+bwd ok" if flex_info["backward_ok"] else f"Tiled W=64+G=4 ({flex_info['note'][:68]})"
-    rows.append(
-        _execute_timed_batches(
-            "h_block_sparse_bf16",
-            m_h,
-            m_h,
-            lambda: sparse_batches,
-            dev,
-            use_bf16=True,
-            peak_flops=peak_flops,
-            notes=flex_note,
+    if flex_info["backward_ok"]:
+        try:
+            m_h_flex = fresh_model(use_flex=True)
+            rows.append(
+                _execute_timed_batches(
+                    "h_block_sparse_bf16",
+                    m_h_flex,
+                    m_h_flex,
+                    lambda: sparse_batches,
+                    dev,
+                    use_bf16=True,
+                    peak_flops=peak_flops,
+                    notes="FlexAttention W=64+G=4 (fwd+bwd)",
+                )
+            )
+        except Exception as flex_exc:
+            m_h = fresh_model(use_flex=False)
+            short_f = (str(flex_exc).splitlines() or [""])[0][:48]
+            rows.append(
+                _execute_timed_batches(
+                    "h_block_sparse_bf16",
+                    m_h,
+                    m_h,
+                    lambda: sparse_batches,
+                    dev,
+                    use_bf16=True,
+                    peak_flops=peak_flops,
+                    notes=f"Tiled SDPA W=64+G=4 (FlexAttn fallback: {short_f})",
+                )
+            )
+    else:
+        m_h = fresh_model(use_flex=False)
+        rows.append(
+            _execute_timed_batches(
+                "h_block_sparse_bf16",
+                m_h,
+                m_h,
+                lambda: sparse_batches,
+                dev,
+                use_bf16=True,
+                peak_flops=peak_flops,
+                notes=f"Tiled SDPA W=64+G=4 ({flex_info['note'][:68]})",
+            )
         )
-    )
 
     # (i) CUDA Graphs: run on CUDA if available, else mark "GPU only, not yet measured"
     if dev.type == "cuda":
         try:
-            m_i = fresh_model()
-            # optimizer.step() runs inside graph capture, which requires capturable=True
-            opt_i = torch.optim.AdamW(m_i.parameters(), lr=3e-4, capturable=True)
             # Filter full-sized batches for static graph shape
             full_packed = [b for b in packed_batches if b.input_ids.shape[0] == pack_rows_per_batch]
-            runner = CudaGraphStepRunner(
-                m_i, opt_i, pack_rows=pack_rows_per_batch, pack_len=pack_len, use_bf16=True, device=dev
-            )
             if full_packed:
+                m_i = fresh_model()
+                # optimizer.step() runs inside graph capture, which requires capturable=True
+                opt_i = torch.optim.AdamW(m_i.parameters(), lr=3e-4, capturable=True)
+                runner = CudaGraphStepRunner(
+                    m_i, opt_i, pack_rows=pack_rows_per_batch, pack_len=pack_len, use_bf16=True, device=dev
+                )
                 runner.replay_step(full_packed[0].to(dev, non_blocking=True))
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
@@ -1210,6 +1437,27 @@ def run_fill_gpu_ablation(
                         speedup_vs_baseline=(real_sum / dt) / base_tps,
                         final_loss=loss_v,
                         notes="CUDA Graph static replay",
+                        real_tokens=real_sum,
+                        total_tokens=slot_sum,
+                    )
+                )
+            else:
+                rows.append(
+                    AblationRow(
+                        config="i_cuda_graphs",
+                        status="skipped (no full static batch)",
+                        real_tokens_per_sec=0.0,
+                        useful_token_fraction=0.0,
+                        step_time_ms=0.0,
+                        data_wait_ms=0.0,
+                        compute_ms=0.0,
+                        data_wait_fraction=0.0,
+                        useful_tflops_per_sec=0.0,
+                        executed_tflops_per_sec=0.0,
+                        mfu="N/A",
+                        speedup_vs_baseline=0.0,
+                        final_loss=float("nan"),
+                        notes=f"fewer than pack_rows_per_batch={pack_rows_per_batch} packed rows",
                     )
                 )
         except Exception as exc:

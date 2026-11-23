@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from labfill.checker import check_protocols_batched, check_protocols_python
@@ -21,7 +22,6 @@ from labfill.protocol import (
     ERR_SEALED,
     ERR_TIP_ALREADY_ON,
     ERR_UNBALANCED,
-    LabStateBatch,
     OP_CENTRIFUGE,
     OP_DROP_TIP,
     OP_INCUBATE,
@@ -33,6 +33,7 @@ from labfill.protocol import (
     OP_UNSEAL,
     PIP_P20,
     PIP_P200,
+    LabStateBatch,
     ProtocolBatch,
     make_pcr_protocol,
     make_random_protocols,
@@ -162,3 +163,143 @@ def test_python_vs_batched_equivalence_on_thousands_of_random_protocols() -> Non
         assert torch.equal(rb.first_err_step, rp.first_err_step)
         for fname in ("volume", "capacity", "sealed", "frozen", "reagent_mask", "has_tip", "tip_mask"):
             assert torch.equal(getattr(rb.final_state, fname), getattr(rp.final_state, fname)), fname
+
+
+def test_initial_state_invariants_rejected_even_on_noop() -> None:
+    noop_proto = ProtocolBatch.from_steps_list([[]] * 4)
+    st = LabStateBatch(
+        volume=torch.tensor(
+            [
+                [100, -10],   # row 0: negative volume -> ERR_NOT_ENOUGH
+                [250, 100],   # row 1: volume > capacity -> ERR_OVERFLOW
+                [10, 10],     # row 2: negative capacity -> ERR_BAD_CONTAINER
+                [10, 10],     # row 3: negative reagent_mask -> ERR_CONTAMINATED
+            ],
+            dtype=torch.int64,
+        ),
+        capacity=torch.tensor(
+            [
+                [200, 200],
+                [200, 200],
+                [200, -5],
+                [200, 200],
+            ],
+            dtype=torch.int64,
+        ),
+        sealed=torch.zeros((4, 2), dtype=torch.bool),
+        frozen=torch.zeros((4, 2), dtype=torch.bool),
+        reagent_mask=torch.tensor(
+            [
+                [1, 0],
+                [1, 0],
+                [1, 0],
+                [-1, 0],
+            ],
+            dtype=torch.int64,
+        ),
+    )
+    rb = check_protocols_batched(st, noop_proto)
+    rp = check_protocols_python(st, noop_proto)
+    expected = [ERR_NOT_ENOUGH, ERR_OVERFLOW, ERR_BAD_CONTAINER, ERR_CONTAMINATED]
+    assert rb.err_code.tolist() == expected
+    assert rp.err_code.tolist() == expected
+    assert rb.first_err_step.tolist() == [0, 0, 0, 0]
+    assert rp.first_err_step.tolist() == [0, 0, 0, 0]
+    assert not bool(rb.ok.any().item())
+
+
+def test_empty_batch_zero_containers_and_mismatch_guards() -> None:
+    st_empty = LabStateBatch(
+        volume=torch.zeros((0, 4), dtype=torch.int64),
+        capacity=torch.full((0, 4), 100, dtype=torch.int64),
+        sealed=torch.zeros((0, 4), dtype=torch.bool),
+        frozen=torch.zeros((0, 4), dtype=torch.bool),
+    )
+    pr_empty = ProtocolBatch.from_steps_list([])
+    rb = check_protocols_batched(st_empty, pr_empty)
+    rp = check_protocols_python(st_empty, pr_empty)
+    assert rb.ok.shape == (0,)
+    assert rp.ok.shape == (0,)
+
+    st_zero_c = LabStateBatch(
+        volume=torch.zeros((2, 0), dtype=torch.int64),
+        capacity=torch.zeros((2, 0), dtype=torch.int64),
+        sealed=torch.zeros((2, 0), dtype=torch.bool),
+        frozen=torch.zeros((2, 0), dtype=torch.bool),
+    )
+    pr_two = ProtocolBatch.from_steps_list([[], []])
+    with pytest.raises(ValueError, match="at least 1 container"):
+        check_protocols_batched(st_zero_c, pr_two)
+    with pytest.raises(ValueError, match="at least 1 container"):
+        check_protocols_python(st_zero_c, pr_two)
+
+    st_one = _base_broken_state()
+    with pytest.raises(ValueError, match="Batch size mismatch"):
+        check_protocols_batched(st_one, pr_two)
+
+
+def test_broken_back_up_row_serial_dilution_concentration_guard() -> None:
+    # Mirrors YLM/lean/LabLean/Examples/Broken.lean `backUpRow`:
+    # 0=PBS (diluent bit 0), 1=FLUO stock (bit 1), 2=col1, 3=col2, 4=col3
+    st = LabStateBatch(
+        volume=torch.tensor([[ul(2000), ul(500), 0, 0, 0]], dtype=torch.int64),
+        capacity=torch.tensor([[ul(5000), ul(1500), ul(300), ul(300), ul(300)]], dtype=torch.int64),
+        sealed=torch.zeros((1, 5), dtype=torch.bool),
+        frozen=torch.zeros((1, 5), dtype=torch.bool),
+        reagent_mask=torch.tensor([[1 << 0, 1 << 1, 0, 0, 0]], dtype=torch.int64),
+        diluent_mask=1 << 0,
+    )
+    setup_steps = [
+        # fillPBS into col2 (3) and col3 (4)
+        {"op": OP_PICK_TIP},
+        {"op": OP_TRANSFER, "pipette": PIP_P200, "src": 0, "dst": 3, "vol": ul(100)},
+        {"op": OP_TRANSFER, "pipette": PIP_P200, "src": 0, "dst": 4, "vol": ul(100)},
+        {"op": OP_DROP_TIP},
+        # fillStock into col1 (2)
+        {"op": OP_PICK_TIP},
+        {"op": OP_TRANSFER, "pipette": PIP_P200, "src": 1, "dst": 2, "vol": ul(200)},
+        {"op": OP_DROP_TIP},
+    ]
+    forward_steps = setup_steps + [
+        {"op": OP_PICK_TIP},
+        {"op": OP_TRANSFER, "pipette": PIP_P200, "src": 2, "dst": 3, "vol": ul(100)},
+        {"op": OP_MIX, "pipette": PIP_P200, "src": 3, "vol": ul(100)},
+        {"op": OP_TRANSFER, "pipette": PIP_P200, "src": 3, "dst": 4, "vol": ul(100)},
+        {"op": OP_MIX, "pipette": PIP_P200, "src": 4, "vol": ul(100)},
+        {"op": OP_DROP_TIP},
+    ]
+    # Re-entering col2 (1/2 stock) with tip that touched col3 (1/4 stock) must fail!
+    back_up_row_steps = forward_steps[:-1] + [
+        {"op": OP_MIX, "pipette": PIP_P200, "src": 3, "vol": ul(100)},
+        {"op": OP_DROP_TIP},
+    ]
+
+    protos = ProtocolBatch.from_steps_list([forward_steps, back_up_row_steps])
+    st2 = st.repeat_batch(2)
+    rb = check_protocols_batched(st2, protos)
+    rp = check_protocols_python(st2, protos)
+    assert rb.err_code.tolist() == [ERR_OK, ERR_CONTAMINATED]
+    assert rp.err_code.tolist() == [ERR_OK, ERR_CONTAMINATED]
+
+
+def test_incubate_thaw_and_high_temp_seal_preconditions() -> None:
+    st = _base_broken_state()  # container 2 is frozen, container 6 is thawed & unsealed
+    cases = [
+        # Incubating a frozen container fails with ERR_FROZEN
+        ([{"op": OP_INCUBATE, "src": 2, "temp": 37, "duration": 30}], ERR_FROZEN),
+        # Incubating >= 80 C without sealing fails with ERR_NOT_SEALED
+        ([{"op": OP_INCUBATE, "src": 6, "temp": 95, "duration": 30}], ERR_NOT_SEALED),
+        # Incubating >= 80 C after sealing succeeds
+        ([{"op": OP_SEAL, "src": 6}, {"op": OP_INCUBATE, "src": 6, "temp": 95, "duration": 30}], ERR_OK),
+        # Incubating < 80 C unsealed succeeds
+        ([{"op": OP_INCUBATE, "src": 6, "temp": 65, "duration": 30}], ERR_OK),
+        # Redundant OP_THAW on already-thawed container 0 fails with ERR_FROZEN
+        ([{"op": OP_THAW, "src": 0}], ERR_FROZEN),
+    ]
+    protos = ProtocolBatch.from_steps_list([c[0] for c in cases])
+    st_b = st.repeat_batch(len(cases))
+    rb = check_protocols_batched(st_b, protos)
+    rp = check_protocols_python(st_b, protos)
+    expected = [c[1] for c in cases]
+    assert rb.err_code.tolist() == expected
+    assert rp.err_code.tolist() == expected

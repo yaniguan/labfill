@@ -28,7 +28,8 @@ Within the [Auto-Lab](https://github.com/yaniguan/auto-lab) Brain/Body architect
 |---|---|---|
 | `labfill.protocol` | Step dicts or generator seeds (`B, T, C`) | `LabStateBatch` `(B, C)` + `ProtocolBatch` `(B, T)` (`int64`/`bool` tensors) |
 | `labfill.checker` | `LabStateBatch`, `ProtocolBatch` | `CheckResult` (`ok`, `err_code`, `first_err_step`, `final_state`) |
-| `labfill.twins` | Valid/broken `(LabStateBatch, ProtocolBatch)`, `error_type`, `K` | Corrupted twins, `TwinRecallReport`, `GenerateKeepResult`, `RepairResult` |
+| `labfill.lablean_io` | `LabStateBatch`, `ProtocolBatch` (or JSON AST) | Lean 4 `LabState` + `List Step` modules, JSON AST, `ERR_* <-> LabLean.Error` tags |
+| `labfill.twins` | Valid/broken `(LabStateBatch, ProtocolBatch)`, `error_type`, `K` | Corrupted twins, `TwinRecallReport`, `GenerateKeepResult`, `RepairResult`, DPO/`twinstep` JSONL |
 | `labfill.planner` | `StepDAGProblem` (`S <= 62`) or durations `(J,)` / `(J, M)` | `DAGPlanResult` (valid topological order) / `ScheduleResult` (assignment, makespan) |
 | `labfill.fill_gpu` | `ProtocolSequenceItem` list (`tokens`, `labels`, `raw_text`) | `PreparedBatch`, `AblationRow` metrics, `torch.profiler` ops, `FlexAttention` probe |
 | `labfill.plate` | 96-well + reservoir `LabStateBatch` (`C >= 96`), `ProtocolBatch` | `PlateRehearsalResult` (`well_volumes_tenths_ul`, `well_volumes_ul`, `solute_conc`) |
@@ -145,8 +146,8 @@ Recipe 2 (`make_error_twin`, `generate_check_keep`, `batched_repair`) implements
 4. **Honest Useful-vs-Executed FLOP Separation**: `count_batch_training_flops` credits only non-pad tokens and intra-document `sum(s_i^2)` attention toward useful throughput and MFU, preventing padding FLOP inflation.
 
 ### Known Modeling Divergences & Limits (vs. `YLM` LabLean)
-- **Bitmask vs. Concentration-Monotonic Tip Contamination**: `labfill` tracks up to 62 reagents via `int64` presence bitmasks (`(tip_mask & ~src_rmask) != 0`). This permits single-tip multi-dispense from stock into empty wells, but—unlike `LabLean`'s `mayEnterB` concentration check—cannot detect aspirating from a low-concentration dilution well back into a higher-concentration well sharing the same reagent bitset.
-- **Unvalidated Initial State & Two-Slot Centrifuge**: `check_protocols_batched` assumes `init_state` is well-formed (it does not pre-check `0 <= volume <= capacity` before step 0) and models centrifugation as a 2-container volume-difference check (`<= 5.0 uL`, both containers sealed) rather than `LabLean`'s `n`-slot rotor mass balance with container tare and reagent densities.
+- **Aggregated Non-Diluent Solute vs. Per-Reagent Concentration Vectors**: `labfill` combines `int64` reagent presence bitmasks (`(tip_mask & ~src_rmask) != 0`) with integer non-diluent solute tracking (`AMT_SCALE = 10000`, `CONC_TOL_PERMILLE = 1`, `diluent_mask`), catching serial-dilution back-transfers (`Broken.backUpRow`), whereas `LabLean` tracks independent `(reagent_name, amount)` pairs per reagent.
+- **Two-Slot Volume Centrifuge vs. `N`-Slot Mass Rotor**: `check_protocols_batched` validates initial-state invariants (`0 <= volume <= capacity`) before step 0, and models centrifugation as a 2-container volume-difference check (`<= 5.0 uL`, both containers sealed) rather than `LabLean`'s `n`-slot rotor mass balance with container tare and reagent densities.
 - **Self-Consistent Synthetic Twins**: Twin recall (`100%`) reflects rule self-consistency on synthetic mutations rather than empirical recall on noisy human/LLM wet-lab transcripts.
 
 ### Ecosystem Interfaces

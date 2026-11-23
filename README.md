@@ -32,16 +32,18 @@ labfill/
 │   ├── __init__.py          # Public API exports
 │   ├── protocol.py          # LabStateBatch, ProtocolBatch, PCR & random generators (0.1 uL units)
 │   ├── checker.py           # Batched PyTorch checker & plain-Python reference checker
-│   ├── twins.py             # 7 seeded-error twins, generate/check/keep, batched K-edit repair
+│   ├── lablean_io.py        # Bidirectional YLM LabLean (.lean / JSON AST) exporter & error bridge
+│   ├── twins.py             # 7 seeded-error twins, generate/check/keep, batched K-edit repair & JSONL bridge
 │   ├── planner.py           # Checker-gated DAG beam search & parallel SA instrument scheduler
-│   ├── fill_gpu.py          # ProtocolTransformer, packing/varlen/block-sparse/CUDA-Graph ablation
+│   ├── fill_gpu.py          # ProtocolTransformer, packing/varlen/block-sparse/FlexAttn/CUDA-Graph ablation
 │   └── plate.py             # Batched 96-well plate rehearsal & solute concentration tracking
 ├── recipes/                 # Runnable end-to-end recipes (01..05)
 ├── benchmarks/run_all.py    # Reproducible JSON + Markdown benchmark harness
 ├── docs/
 │   ├── ARCHITECTURE_AND_HISTORY.md
+│   ├── DESIGN.md
 │   └── related_work.md
-└── tests/                   # Differential checker, twin/repair, DAG/SA, packing, and plate tests
+└── tests/                   # Differential checker, LabLean conformance, twin/repair, DAG/SA, packing, and plate tests
 ```
 
 ## Recipes
