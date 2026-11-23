@@ -1,0 +1,6 @@
+name = "labfill_lean"
+version = "0.1.0"
+defaultTargets = ["LabFillLean"]
+
+[[lean_lib]]
+name = "LabFillLean"
