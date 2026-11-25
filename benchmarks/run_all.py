@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run all labfill CPU benchmarks and write JSON + Markdown tables to benchmarks/results/."""
+"""Run all labfill CPU/GPU benchmarks and write JSON + Markdown tables to benchmarks/results/."""
 
 from __future__ import annotations
 
@@ -7,7 +7,9 @@ import datetime as dt
 import json
 import os
 import platform
+import shutil
 import statistics
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -25,7 +27,12 @@ from labfill.checker import (
     check_protocols_python_lists,
     export_python_inputs,
 )
-from labfill.fill_gpu import AblationRow, run_fill_gpu_ablation
+from labfill.fill_gpu import (
+    _FLASH_ATTN_VARLEN_FUNC,
+    AblationRow,
+    detect_gpu_peak_flops,
+    run_fill_gpu_ablation,
+)
 from labfill.planner import (
     batched_beam_plan_dag,
     make_assay_dag_problem,
@@ -45,7 +52,40 @@ from labfill.twins import (
 )
 
 
-def read_cpu_info() -> dict[str, Any]:
+def _query_nvidia_smi() -> dict[str, str] | None:
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                smi,
+                "--query-gpu=driver_version,clocks.current.sm,clocks.max.sm,power.draw,power.limit",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        first_line = proc.stdout.strip().splitlines()[0]
+        parts = [p.strip() for p in first_line.split(",")]
+        if len(parts) >= 5:
+            return {
+                "driver_version": parts[0],
+                "sm_clock_mhz": parts[1],
+                "sm_max_clock_mhz": parts[2],
+                "power_draw_w": parts[3],
+                "power_limit_w": parts[4],
+            }
+    except Exception:
+        return None
+    return None
+
+
+def read_cpu_info(dev: torch.device | None = None) -> dict[str, Any]:
     cpu_model = platform.processor() or "unknown"
     flags_found: list[str] = []
     cpuinfo_path = Path("/proc/cpuinfo")
@@ -64,25 +104,46 @@ def read_cpu_info() -> dict[str, Any]:
                 break
 
     load_avg = list(os.getloadavg()) if hasattr(os, "getloadavg") else None
+    cuda_avail = torch.cuda.is_available()
+    eff_type = dev.type if dev is not None else ("cuda" if cuda_avail else "cpu")
+    use_cuda_meta = eff_type == "cuda" and cuda_avail
+
+    gpu_name = torch.cuda.get_device_name(0) if use_cuda_meta else "none (CPU only)"
+    gpu_cc: str | None = None
+    gpu_vram_mb: int | None = None
+    if use_cuda_meta:
+        props = torch.cuda.get_device_properties(0)
+        gpu_cc = f"{props.major}.{props.minor}"
+        gpu_vram_mb = int(props.total_memory // (1024 * 1024))
 
     return {
         "date": dt.date.today().isoformat(),
+        "device_type": eff_type,
         "cpu_model": cpu_model,
         "cpu_cores": os.cpu_count() or 1,
         "torch_num_threads": torch.get_num_threads(),
         "cpu_isa_highlights": flags_found,
         "python_version": platform.python_version(),
         "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "flash_attn_available": _FLASH_ATTN_VARLEN_FUNC is not None,
         "numpy_version": np.__version__,
         "load_avg_1_5_15_at_start": load_avg,
-        "cuda_available": torch.cuda.is_available(),
-        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none (CPU only)",
+        "cuda_available": use_cuda_meta,
+        "gpu_name": gpu_name,
+        "gpu_compute_capability": gpu_cc,
+        "gpu_vram_mb": gpu_vram_mb,
+        "nvidia_smi_telemetry": _query_nvidia_smi() if use_cuda_meta else None,
     }
 
 
-def bench_recipe1(dev: torch.device, repeats: int = 5) -> list[dict[str, Any]]:
+def bench_recipe1(
+    dev: torch.device,
+    repeats: int = 5,
+    batch_sizes: tuple[int, ...] = (1, 64, 1024, 16384),
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for b in (1, 64, 1024, 16384):
+    for b in batch_sizes:
         st, pr = make_random_protocols(b, max_steps=24, error_prob=0.5, seed=100 + b, device=dev)
         py_in = export_python_inputs(st, pr)
 
@@ -90,7 +151,7 @@ def bench_recipe1(dev: torch.device, repeats: int = 5) -> list[dict[str, Any]]:
         check_protocols_batched(st, pr)
         check_protocols_python_lists(py_in)
 
-        py_reps = 3 if b == 16384 else repeats
+        py_reps = min(3, repeats) if b == 16384 else repeats
         py_times: list[float] = []
         for _ in range(py_reps):
             t0 = time.perf_counter()
@@ -100,15 +161,21 @@ def bench_recipe1(dev: torch.device, repeats: int = 5) -> list[dict[str, Any]]:
         th_times: list[float] = []
         for _ in range(repeats):
             if dev.type == "cuda":
+                start_ev = torch.cuda.Event(enable_timing=True)
+                end_ev = torch.cuda.Event(enable_timing=True)
                 torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            check_protocols_batched(st, pr)
-            if dev.type == "cuda":
+                start_ev.record()
+                check_protocols_batched(st, pr)
+                end_ev.record()
                 torch.cuda.synchronize()
-            th_times.append(time.perf_counter() - t0)
+                th_times.append(max(float(start_ev.elapsed_time(end_ev)) / 1000.0, 1e-9))
+            else:
+                t0 = time.perf_counter()
+                check_protocols_batched(st, pr)
+                th_times.append(max(time.perf_counter() - t0, 1e-9))
 
-        py_med = statistics.median(py_times)
-        th_med = statistics.median(th_times)
+        py_med = max(statistics.median(py_times), 1e-9)
+        th_med = max(statistics.median(th_times), 1e-9)
         py_rate = b / py_med
         th_rate = b / th_med
         rows.append(
@@ -120,25 +187,31 @@ def bench_recipe1(dev: torch.device, repeats: int = 5) -> list[dict[str, Any]]:
                 "torch_cpu_ms": round(th_med * 1000.0, 3) if dev.type == "cpu" else "not yet measured",
                 "torch_vs_python_ratio": round(th_rate / py_rate, 3),
                 "torch_gpu_proto_per_sec": round(th_rate, 1) if dev.type == "cuda" else "not yet measured",
+                "torch_gpu_ms": round(th_med * 1000.0, 3) if dev.type == "cuda" else "not yet measured",
             }
         )
     return rows
 
 
-def bench_recipe2(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
-    recall_rep = measure_twin_recall(batch_size=512, seed=0, device=dev)
+def bench_recipe2(
+    dev: torch.device,
+    repeats: int = 3,
+    num_candidates: int = 4096,
+    base_batch: int = 128,
+) -> dict[str, Any]:
+    recall_rep = measure_twin_recall(batch_size=min(512, max(base_batch, 32)), seed=0, device=dev)
 
     gk_rates: list[float] = []
     gk_kept_frac = 0.0
     gk_rej: dict[str, int] = {}
     for r in range(repeats):
-        gk = generate_check_keep(num_candidates=4096, mutation_rate=0.25, seed=10 + r, device=dev)
+        gk = generate_check_keep(num_candidates=num_candidates, mutation_rate=0.25, seed=10 + r, device=dev)
         gk_rates.append(gk.candidates_per_sec)
         if r == 0:
             gk_kept_frac = gk.kept_fraction
             gk_rej = gk.rejection_counts
 
-    st_base, pr_base = make_random_valid_protocols(128, seed=22, device=dev)
+    st_base, pr_base = make_random_valid_protocols(base_batch, seed=22, device=dev)
     repair_rows: list[dict[str, Any]] = []
     for idx, et in enumerate(TWIN_ERROR_TYPES):
         st_b, pr_b = make_error_twin(st_base, pr_base, et, seed=30 + idx)
@@ -166,7 +239,7 @@ def bench_recipe2(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
     return {
         "false_positive_rate_on_valid": recall_rep.false_positive_rate_on_valid,
         "generate_check_keep": {
-            "num_candidates": 4096,
+            "num_candidates": num_candidates,
             "kept_fraction": round(gk_kept_frac, 4),
             "cpu_candidates_per_sec": gk_med if dev.type == "cpu" else "not yet measured",
             "gpu_candidates_per_sec": gk_med if dev.type == "cuda" else "not yet measured",
@@ -176,7 +249,7 @@ def bench_recipe2(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
     }
 
 
-def bench_recipe3(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
+def bench_recipe3(dev: torch.device, repeats: int = 3, sa_steps: int = 300) -> dict[str, Any]:
     dag = make_assay_dag_problem(device=dev)
     _, rand_topo_pass = sample_random_topological_orders(dag, num_samples=512, seed=0)
 
@@ -194,7 +267,7 @@ def bench_recipe3(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
     for name, fn in (
         ("greedy_arrival", lambda: schedule_greedy_list(durs, 8, sort_lpt=False)),
         ("greedy_lpt", lambda: schedule_greedy_list(durs, 8, sort_lpt=True)),
-        ("batched_sa_r256", lambda: schedule_batched_sa(durs, 8, num_restarts=256, num_steps=300, seed=0)),
+        ("batched_sa_r256", lambda: schedule_batched_sa(durs, 8, num_restarts=256, num_steps=sa_steps, seed=0)),
     ):
         fn()  # warmup
         ms_times: list[float] = []
@@ -229,24 +302,84 @@ def bench_recipe3(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
     }
 
 
-def bench_recipe4(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
+def resolve_benchmark_peak_flops(
+    dev: torch.device,
+    peak_tflops_override: float | None = None,
+    gpu_name: str | None = None,
+) -> tuple[float | None, str]:
+    """Resolve calibrated hardware peak FLOP/s and diagnostic label for Recipe 4 MFU."""
+    if peak_tflops_override is not None:
+        return detect_gpu_peak_flops(gpu_name=gpu_name, override_tflops=peak_tflops_override)
+    if dev.type == "cuda":
+        inferred_name = gpu_name
+        if inferred_name is None and torch.cuda.is_available():
+            inferred_name = torch.cuda.get_device_name(0)
+        return detect_gpu_peak_flops(inferred_name, precision="bf16")
+    return None, "N/A"
+
+
+def bench_recipe4(
+    dev: torch.device,
+    repeats: int = 3,
+    peak_flops: float | None = None,
+    peak_tflops_override: float | None = None,
+    smoke: bool = False,
+) -> dict[str, Any]:
+    if peak_flops is not None:
+        resolved_peak = peak_flops
+        peak_desc = f"explicit ({peak_flops / 1e12:.2f} TFLOPS)"
+    else:
+        resolved_peak, peak_desc = resolve_benchmark_peak_flops(
+            dev, peak_tflops_override=peak_tflops_override
+        )
+
+    mfu_na_label = peak_desc if (resolved_peak is None and dev.type == "cuda") else "N/A"
+
+    if smoke:
+        num_sequences = 24
+        batch_size = 8
+        pack_rows_per_batch = 1
+        d_model = 64
+        n_layers = 2
+        slow_work_iters = 20
+        include_varlen_bf16 = True
+    elif dev.type == "cuda":
+        # GPU-scale batch sizing to saturate A100/H100 SMs and warm Inductor/Triton kernels
+        num_sequences = 512
+        batch_size = 32
+        pack_rows_per_batch = 8
+        d_model = 256
+        n_layers = 4
+        slow_work_iters = 8000
+        include_varlen_bf16 = True
+    else:
+        num_sequences = 96
+        batch_size = 16
+        pack_rows_per_batch = 2
+        d_model = 256
+        n_layers = 4
+        slow_work_iters = 8000
+        include_varlen_bf16 = False
+
     runs: list[list[AblationRow]] = []
     prof_ops: list[dict[str, Any]] = []
     flex_info: dict[str, Any] = {}
 
     for r in range(repeats):
         rows, p_ops, f_info = run_fill_gpu_ablation(
-            num_sequences=96,
-            batch_size=16,
+            num_sequences=num_sequences,
+            batch_size=batch_size,
             pack_len=512,
-            pack_rows_per_batch=2,
-            d_model=256,
-            n_layers=4,
+            pack_rows_per_batch=pack_rows_per_batch,
+            d_model=d_model,
+            n_layers=n_layers,
             n_heads=4,
-            slow_work_iters=8000,
-            peak_flops=None,
+            slow_work_iters=slow_work_iters,
+            peak_flops=resolved_peak,
             seed=r,
             device=dev,
+            include_varlen_bf16=include_varlen_bf16,
+            mfu_na_label=mfu_na_label,
         )
         runs.append(rows)
         if r == 0:
@@ -277,6 +410,12 @@ def bench_recipe4(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
         med_e_tflops = statistics.median([runs[r][c_i].executed_tflops_per_sec for r in range(repeats)])
         med_loss = statistics.median([runs[r][c_i].final_loss for r in range(repeats)])
 
+        mfu_val = (
+            f"{100.0 * (med_u_tflops * 1e12) / resolved_peak:.2f}%"
+            if resolved_peak is not None
+            else sample.mfu
+        )
+
         agg_rows.append(
             {
                 "config": sample.config,
@@ -289,7 +428,7 @@ def bench_recipe4(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
                 "data_wait_fraction": round(med_wait_frac, 4),
                 "useful_tflops_per_sec": round(med_u_tflops, 4),
                 "executed_tflops_per_sec": round(med_e_tflops, 4),
-                "mfu": sample.mfu,
+                "mfu": mfu_val,
                 "speedup_vs_baseline": round(med_tps / max(base_tps, 1e-6), 2),
                 "final_loss": round(med_loss, 4),
                 "gpu_tokens_per_sec": round(med_tps, 1) if dev.type == "cuda" else "not yet measured",
@@ -299,24 +438,37 @@ def bench_recipe4(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
 
     return {
         "ablation": agg_rows,
+        "peak_flops_per_sec": resolved_peak,
+        "peak_flops_source": peak_desc,
+        "profiler_top_ops": prof_ops,
         "profiler_top_cpu_ops": prof_ops,
         "flex_attention_probe": flex_info,
     }
 
 
-def bench_recipe5(dev: torch.device, repeats: int = 3) -> dict[str, Any]:
-    st, pr = make_serial_dilution_plate_batch(batch_size=128, num_rows_active=4, seed=0, device=dev)
+def bench_recipe5(dev: torch.device, repeats: int = 3, batch_plates: int = 128) -> dict[str, Any]:
+    st, pr = make_serial_dilution_plate_batch(batch_size=batch_plates, num_rows_active=4, seed=0, device=dev)
     rehearse_96well_protocols(st, pr)  # warmup
     times: list[float] = []
     res = rehearse_96well_protocols(st, pr)
     for _ in range(repeats):
-        res = rehearse_96well_protocols(st, pr)
-        times.append(res.elapsed_sec)
+        if dev.type == "cuda":
+            start_ev = torch.cuda.Event(enable_timing=True)
+            end_ev = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start_ev.record()
+            res = rehearse_96well_protocols(st, pr)
+            end_ev.record()
+            torch.cuda.synchronize()
+            times.append(max(float(start_ev.elapsed_time(end_ev)) / 1000.0, 1e-9))
+        else:
+            res = rehearse_96well_protocols(st, pr)
+            times.append(max(res.elapsed_sec, 1e-9))
     med_s = statistics.median(times)
-    rate = round(128.0 / med_s, 1)
+    rate = round(float(batch_plates) / med_s, 1)
     ms = round(med_s * 1000.0, 2)
     return {
-        "batch_plates": 128,
+        "batch_plates": batch_plates,
         "steps_per_plate": pr.max_steps,
         "all_valid": bool(res.check.ok.all().item()),
         "volume_conserved": bool(res.volume_conserved.all().item()),
@@ -349,7 +501,12 @@ def format_markdown_report(payload: dict[str, Any]) -> str:
     lines.append(f"- **ISA highlights**: `{', '.join(m['cpu_isa_highlights']) or 'standard'}`")
     lines.append(f"- **Software**: Python {m['python_version']}, PyTorch {m['torch_version']}, NumPy {m['numpy_version']}")
     if gpu_measured:
-        lines.append(f"- **GPU**: {m['gpu_name']}\n")
+        gpu_extra = ""
+        if m.get("cuda_version"):
+            gpu_extra += f", CUDA {m['cuda_version']}"
+        if m.get("gpu_vram_mb"):
+            gpu_extra += f", {m['gpu_vram_mb']} MB VRAM"
+        lines.append(f"- **GPU**: {m['gpu_name']}{gpu_extra}\n")
     else:
         lines.append(f"- **GPU**: {m['gpu_name']} (all GPU columns below: `not yet measured`)\n")
 
@@ -426,6 +583,8 @@ def format_markdown_report(payload: dict[str, Any]) -> str:
     # Recipe 4
     r4 = payload["recipe4_fill_one_gpu"]
     lines.append("## Recipe 4: Fill One GPU Ablation (4-layer d=256 Transformer, lognormal 8..512 tokens)\n")
+    if r4.get("peak_flops_source") and r4.get("peak_flops_source") != "N/A":
+        lines.append(f"- **MFU Peak Reference**: `{r4['peak_flops_source']}`\n")
     lines.append(
         "| Config | Real tok/s (CPU) | Useful-token % | Step Time (ms) | Data-wait % | Speedup vs (a) | MFU | GPU tok/s | Notes |"
     )
@@ -468,12 +627,34 @@ RECIPES = {
 }
 
 
+def resolve_part_dir(out_dir: Path, dev: torch.device, tag: str = "") -> Path:
+    """Return device-isolated part cache directory (`parts*` on CPU vs `parts_gpu*` on CUDA)."""
+    base = "parts_gpu" if dev.type == "cuda" else "parts"
+    return out_dir / (base + (f"_{tag}" if tag else ""))
+
+
+def _part_device_signature(machine: dict[str, Any]) -> tuple[str, str]:
+    dev_type = str(
+        machine.get("device_type", "cuda" if machine.get("cuda_available", False) else "cpu")
+    )
+    gpu_name = str(machine.get("gpu_name", "none (CPU only)"))
+    return dev_type, gpu_name
+
+
 def assemble_payload(loaded: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Merge saved recipe parts into one report payload.
 
-    Raises SystemExit if the parts were measured with different torch thread counts,
-    since the report header would otherwise mislabel some of the numbers.
+    Raises SystemExit if the parts disagree on device (`cpu` vs `cuda` / `gpu_name`) or
+    `torch_num_threads`, preventing CPU/GPU cache cross-contamination.
     """
+    dev_sigs = {k: _part_device_signature(v["machine"]) for k, v in loaded.items()}
+    if len(set(dev_sigs.values())) > 1:
+        detail = ", ".join(f"{k}={dt_name[0]}:{dt_name[1]}" for k, dt_name in dev_sigs.items())
+        raise SystemExit(
+            f"Saved parts disagree on device/GPU ({detail}). Refusing to assemble a mixed CPU/GPU report. "
+            "Re-run with --fresh, or keep CPU and GPU parts in separate cache directories."
+        )
+
     threads = {k: v["machine"]["torch_num_threads"] for k, v in loaded.items()}
     if len(set(threads.values())) > 1:
         detail = ", ".join(f"{k}={t}" for k, t in threads.items())
@@ -490,13 +671,74 @@ def assemble_payload(loaded: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return payload
 
 
+def build_recipe_runners(
+    peak_tflops_override: float | None = None,
+    smoke: bool = False,
+) -> dict[str, tuple[str, Any]]:
+    if smoke:
+        return {
+            "recipe1_validation": (
+                "Recipe 1: Batched protocol validation (smoke)",
+                lambda dev: bench_recipe1(dev, repeats=1, batch_sizes=(1, 64)),
+            ),
+            "recipe2_twins_and_factory": (
+                "Recipe 2: Seeded-error twins, generate/check/keep, batched repair (smoke)",
+                lambda dev: bench_recipe2(dev, repeats=1, num_candidates=256, base_batch=16),
+            ),
+            "recipe3_planning_and_scheduling": (
+                "Recipe 3: Step-DAG planning and instrument scheduling (smoke)",
+                lambda dev: bench_recipe3(dev, repeats=1, sa_steps=30),
+            ),
+            "recipe4_fill_one_gpu": (
+                "Recipe 4: Fill one GPU ablation (smoke)",
+                lambda dev: bench_recipe4(
+                    dev, repeats=1, peak_tflops_override=peak_tflops_override, smoke=True
+                ),
+            ),
+            "recipe5_plate_rehearsal": (
+                "Recipe 5: Batched 96-well plate rehearsal (smoke)",
+                lambda dev: bench_recipe5(dev, repeats=1, batch_plates=16),
+            ),
+        }
+    return {
+        "recipe1_validation": ("Recipe 1: Batched protocol validation", lambda dev: bench_recipe1(dev, repeats=5)),
+        "recipe2_twins_and_factory": ("Recipe 2: Seeded-error twins, generate/check/keep, batched repair", lambda dev: bench_recipe2(dev, repeats=3)),
+        "recipe3_planning_and_scheduling": ("Recipe 3: Step-DAG planning and instrument scheduling", lambda dev: bench_recipe3(dev, repeats=3)),
+        "recipe4_fill_one_gpu": (
+            "Recipe 4: Fill one GPU ablation (median of 3 repeats)",
+            lambda dev: bench_recipe4(dev, repeats=3, peak_tflops_override=peak_tflops_override),
+        ),
+        "recipe5_plate_rehearsal": ("Recipe 5: Batched 96-well plate rehearsal", lambda dev: bench_recipe5(dev, repeats=3)),
+    }
+
+
+def run_smoke_verification(
+    device: str | torch.device | None = None,
+    peak_tflops_override: float | None = None,
+) -> dict[str, Any]:
+    """Execute an honest, self-contained CPU/CUDA smoke check without mutating committed results."""
+    dev = default_device(device)
+    machine = read_cpu_info(dev)
+    runners = build_recipe_runners(peak_tflops_override=peak_tflops_override, smoke=True)
+    loaded: dict[str, dict[str, Any]] = {}
+    for key, (_title, fn) in runners.items():
+        t0 = time.perf_counter()
+        res = fn(dev)
+        loaded[key] = {
+            "machine": machine,
+            "wall_sec": round(time.perf_counter() - t0, 2),
+            "result": res,
+        }
+    payload = assemble_payload(loaded)
+    _ = format_markdown_report(payload)
+    return payload
+
+
 def main() -> None:
     """Run each recipe and save its result right away, so a crash does not lose finished parts.
 
-    Saved parts are reused unless --fresh is passed. The repo ships cached parts from the
-    published run, so pass --fresh to actually re-measure.
-
-    Usage: python benchmarks/run_all.py [--only recipe4_fill_one_gpu] [--fresh] [--threads N --tag tN]
+    CPU and CUDA parts are isolated in separate directories (`parts*` vs `parts_gpu*`) so
+    `--device cuda` never silently reuses committed CPU caches.
     """
     import argparse
 
@@ -506,34 +748,60 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=None, help="torch CPU threads (use 1 on a shared, busy machine)")
     ap.add_argument("--tag", default="", help="suffix for the parts folder and report names, e.g. t1")
     ap.add_argument("--device", default=None, help="device override, e.g. cpu or cuda")
+    ap.add_argument("--peak-tflops", type=float, default=None, help="override hardware peak BF16/FP32 TFLOPS for MFU")
+    ap.add_argument("--smoke", action="store_true", help="run fast smoke verification in memory without overwriting results")
     args = ap.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
 
-    dev = default_device(args.device)
-    machine = read_cpu_info()
-    out_dir = REPO_ROOT / "benchmarks" / "results"
-    part_dir = out_dir / ("parts" + (f"_{args.tag}" if args.tag else ""))
-    part_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Running labfill benchmarks on {machine['cpu_model']} ({machine['cpu_cores']} cores)...")
+    if args.smoke:
+        payload = run_smoke_verification(device=args.device, peak_tflops_override=args.peak_tflops)
+        print(format_markdown_report(payload))
+        return
 
-    keys = [args.only] if args.only else list(RECIPES)
+    dev = default_device(args.device)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("Requested --device cuda, but torch.cuda.is_available() is False.")
+
+    machine = read_cpu_info(dev)
+    runners = build_recipe_runners(peak_tflops_override=args.peak_tflops, smoke=False)
+    out_dir = REPO_ROOT / "benchmarks" / "results"
+    part_dir = resolve_part_dir(out_dir, dev, tag=args.tag)
+    part_dir.mkdir(parents=True, exist_ok=True)
+    target_desc = f"{machine['gpu_name']} (CUDA)" if dev.type == "cuda" else f"{machine['cpu_model']} ({machine['cpu_cores']} cores)"
+    print(f"Running labfill benchmarks on {target_desc}...")
+
+    keys = [args.only] if args.only else list(runners)
     for i, key in enumerate(keys, 1):
         part = part_dir / f"{key}.json"
         if part.exists() and not args.fresh:
-            saved_threads = json.loads(part.read_text(encoding="utf-8"))["machine"]["torch_num_threads"]
-            print(
-                f"  [{i}/{len(keys)}] {key}: saved part found (threads={saved_threads}), skipping; "
-                "pass --fresh to re-measure"
+            saved_obj = json.loads(part.read_text(encoding="utf-8"))
+            saved_machine = saved_obj["machine"]
+            same_dev = _part_device_signature(saved_machine) == _part_device_signature(machine)
+            same_threads = (
+                args.threads is None or saved_machine.get("torch_num_threads") == torch.get_num_threads()
             )
-            continue
-        title, fn = RECIPES[key]
+            if same_dev and same_threads:
+                saved_threads = saved_machine["torch_num_threads"]
+                print(
+                    f"  [{i}/{len(keys)}] {key}: saved part found (device={dev.type}, threads={saved_threads}), "
+                    "skipping; pass --fresh to re-measure"
+                )
+                continue
+        title, fn = runners[key]
         print(f"  [{i}/{len(keys)}] {title}...", flush=True)
         t0 = time.perf_counter()
         res = fn(dev)
-        part.write_text(json.dumps({"machine": machine, "wall_sec": round(time.perf_counter() - t0, 2), "result": res}, indent=2) + "\n", encoding="utf-8")
+        part.write_text(
+            json.dumps(
+                {"machine": machine, "wall_sec": round(time.perf_counter() - t0, 2), "result": res},
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
-    parts = {k: part_dir / f"{k}.json" for k in RECIPES}
+    parts = {k: part_dir / f"{k}.json" for k in runners}
     if not all(p.exists() for p in parts.values()):
         print("Not all recipe parts exist yet; run the missing ones.")
         return

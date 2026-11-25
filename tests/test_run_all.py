@@ -88,3 +88,53 @@ def test_format_markdown_report_cuda_payload() -> None:
     assert "987,654.3" in md
     assert "123,456.7" in md
     assert "not yet measured" in md
+
+
+def test_part_cache_isolation_and_mixed_device_refusal(tmp_path: Path) -> None:
+    import torch
+
+    run_all = _load_run_all()
+    cpu_dir = run_all.resolve_part_dir(tmp_path, torch.device("cpu"), tag="")
+    gpu_dir = run_all.resolve_part_dir(tmp_path, torch.device("cuda"), tag="")
+    assert cpu_dir != gpu_dir
+    assert cpu_dir.name == "parts"
+    assert gpu_dir.name == "parts_gpu"
+    assert run_all.resolve_part_dir(tmp_path, torch.device("cuda"), tag="a100").name == "parts_gpu_a100"
+
+    # Mixing CPU and CUDA parts (even with identical torch_num_threads) MUST fail assemble_payload
+    loaded = copy.deepcopy(_load_parts("parts_t1"))
+    loaded["recipe4_fill_one_gpu"]["machine"]["cuda_available"] = True
+    loaded["recipe4_fill_one_gpu"]["machine"]["device_type"] = "cuda"
+    loaded["recipe4_fill_one_gpu"]["machine"]["gpu_name"] = "NVIDIA A100-SXM4-80GB"
+    with pytest.raises(SystemExit, match="device/GPU"):
+        run_all.assemble_payload(loaded)
+
+
+def test_calibrated_mfu_and_cpu_smoke_verification() -> None:
+    import inspect
+
+    import torch
+
+    run_all = _load_run_all()
+    assert "peak_flops=None" not in inspect.getsource(run_all.bench_recipe4)
+
+    a100_fl, _ = run_all.resolve_benchmark_peak_flops(
+        torch.device("cuda"), gpu_name="NVIDIA A100-SXM4-80GB"
+    )
+    assert a100_fl == pytest.approx(312.0e12)
+
+    unk_fl, unk_label = run_all.resolve_benchmark_peak_flops(
+        torch.device("cuda"), gpu_name="Unknown Research ASIC"
+    )
+    assert unk_fl is None
+    assert "unknown GPU peak" in unk_label
+
+    smoke_payload = run_all.run_smoke_verification(device="cpu", peak_tflops_override=12.5)
+    r4 = smoke_payload["recipe4_fill_one_gpu"]
+    assert r4["peak_flops_per_sec"] == pytest.approx(12.5e12)
+    cfgs = {row["config"]: row for row in r4["ablation"]}
+    assert "e2_packed_varlen_bf16" in cfgs
+    assert cfgs["a_padded_baseline"]["mfu"].endswith("%")
+    assert cfgs["a_padded_baseline"]["gpu_tokens_per_sec"] == "not yet measured"
+    assert "self_cuda_ms" in r4["profiler_top_ops"][0]
+

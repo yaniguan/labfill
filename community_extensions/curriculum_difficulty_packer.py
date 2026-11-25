@@ -62,12 +62,21 @@ class PromptGroupRollout:
 
 @dataclass(frozen=True)
 class PackedSequenceSlice:
-    """Exact Python mirror of `LabFillLean.PackedSlice`."""
+    """Exact Python mirror of `LabFillLean.PackedSlice` with prompt/completion span metadata."""
 
     seq_id: int
     offset: int
     length: int
     curriculum_weight: float = 0.0
+    prompt_len: int = 0
+
+    @property
+    def completion_offset(self) -> int:
+        return self.offset + self.prompt_len
+
+    @property
+    def completion_len(self) -> int:
+        return self.length - self.prompt_len
 
 
 @dataclass(frozen=True)
@@ -103,16 +112,29 @@ def verify_packed_bin(
     expected_real_tokens: int,
     slices: list[PackedSequenceSlice] | tuple[PackedSequenceSlice, ...],
 ) -> tuple[bool, str | None]:
-    """Exact Python mirror of `LabFillLean.checkPackedBin`."""
+    """Exact Python mirror of `LabFillLean.checkPackedBin` (enforcing unique `seq_id`s per bin)."""
+    if bin_cap < 1:
+        return False, "packed_slice_within_bin_cap"
+
     for s in slices:
-        if s.length <= 0 or s.offset < 0 or s.offset + s.length > bin_cap:
+        p_len = int(getattr(s, "prompt_len", 0))
+        if (
+            s.length <= 0
+            or s.offset < 0
+            or s.offset + s.length > bin_cap
+            or p_len < 0
+            or p_len > s.length
+        ):
             return False, "packed_slice_within_bin_cap"
 
-    for a in slices:
-        for b in slices:
+    for idx_a, a in enumerate(slices):
+        for idx_b, b in enumerate(slices):
+            if idx_a == idx_b:
+                continue
+            if a.seq_id == b.seq_id:
+                return False, "packed_slices_non_overlapping"
             disjoint = (
-                a.seq_id == b.seq_id
-                or a.offset + a.length <= b.offset
+                a.offset + a.length <= b.offset
                 or b.offset + b.length <= a.offset
             )
             if not disjoint:
@@ -147,21 +169,43 @@ def filter_and_score_frontier_groups(
 def pack_curriculum_bins_bfd(
     groups: list[PromptGroupRollout] | tuple[PromptGroupRollout, ...],
     bin_cap: int = 2048,
-) -> tuple[list[PackedCurriculumBin], int]:
-    """Filter zero-variance prompt groups and pack frontier prompts via Best-Fit-Decreasing."""
+    overflow_policy: str = "raise",
+) -> Any:
+    """Filter zero-variance prompt groups and pack frontier prompts via Best-Fit-Decreasing.
+
+    Args:
+        groups: Empirical RLVR prompt group rollouts.
+        bin_cap: Maximum tokens per packed bin (`>= 1`).
+        overflow_policy: `'raise'` (default, returns `(packed_bins, dropped)`) or `'quarantine'`
+            (isolates informative groups with `token_len > bin_cap` without aborting the batch and
+            returns `(packed_bins, dropped, quarantined_group_ids)`).
+    """
     if bin_cap < 1:
         raise ValueError("bin_cap must be >= 1")
+    if overflow_policy not in ("raise", "quarantine"):
+        raise ValueError(
+            f"Unsupported overflow_policy={overflow_policy!r}; expected 'raise' or 'quarantine'"
+        )
+    for g in groups:
+        if g.token_len <= 0:
+            raise ValueError(f"group {g.group_id} token_len={g.token_len} must be >= 1")
 
     informative, dropped = filter_and_score_frontier_groups(groups)
+    quarantined_ids: list[int] = []
+    packable: list[PromptGroupRollout] = []
     for g in informative:
-        if g.token_len <= 0 or g.token_len > bin_cap:
-            raise ValueError(
-                f"group {g.group_id} token_len={g.token_len} outside [1, {bin_cap}]"
-            )
+        if g.token_len > bin_cap:
+            if overflow_policy == "raise":
+                raise ValueError(
+                    f"group {g.group_id} token_len={g.token_len} outside [1, {bin_cap}]"
+                )
+            quarantined_ids.append(g.group_id)
+        else:
+            packable.append(g)
 
     # Best-Fit-Decreasing order: largest sequence first, breaking ties by highest p*(1-p)
     ordered = sorted(
-        informative,
+        packable,
         key=lambda g: (g.token_len, g.curriculum_weight, -g.group_id),
         reverse=True,
     )
@@ -201,6 +245,8 @@ def pack_curriculum_bins_bfd(
     packed_bins = [
         PackedCurriculumBin(bin_cap=bin_cap, slices=tuple(sls)) for sls in bin_slices
     ]
+    if overflow_policy == "quarantine":
+        return packed_bins, dropped, tuple(quarantined_ids)
     return packed_bins, dropped
 
 
@@ -208,19 +254,22 @@ def materialize_bf16_packed_batch(
     packed_bins: list[PackedCurriculumBin] | tuple[PackedCurriculumBin, ...],
     bin_cap: int = 2048,
 ) -> dict[str, torch.Tensor]:
-    """Materialize packed sequence IDs, reset position_ids, and bf16 curriculum weights."""
+    """Materialize packed sequence IDs, reset position_ids, completion masks, and bf16 curriculum weights."""
     num_bins = len(packed_bins)
     seq_ids = torch.zeros((num_bins, bin_cap), dtype=torch.int32)
     position_ids = torch.zeros((num_bins, bin_cap), dtype=torch.int32)
+    completion_mask = torch.zeros((num_bins, bin_cap), dtype=torch.bool)
     weights_bf16 = torch.zeros((num_bins, bin_cap), dtype=torch.bfloat16)
 
     for b_idx, pbin in enumerate(packed_bins):
         for sl in pbin.slices:
             end = sl.offset + sl.length
+            p_len = int(getattr(sl, "prompt_len", 0))
             seq_ids[b_idx, sl.offset : end] = int(sl.seq_id) + 1
             position_ids[b_idx, sl.offset : end] = torch.arange(
                 sl.length, dtype=torch.int32
             )
+            completion_mask[b_idx, sl.offset + p_len : end] = True
             weights_bf16[b_idx, sl.offset : end] = torch.tensor(
                 sl.curriculum_weight, dtype=torch.bfloat16
             )
@@ -228,6 +277,7 @@ def materialize_bf16_packed_batch(
     return {
         "seq_ids": seq_ids,
         "position_ids": position_ids,
+        "completion_mask": completion_mask,
         "curriculum_weights_bf16": weights_bf16,
     }
 

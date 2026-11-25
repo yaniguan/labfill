@@ -30,6 +30,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from labfill.protocol import default_device
 
+try:
+    from flash_attn import flash_attn_varlen_func as _FLASH_ATTN_VARLEN_FUNC  # type: ignore[import-not-found]
+except ImportError:
+    _FLASH_ATTN_VARLEN_FUNC = None
+
+_COMPILED_FLEX_ATTENTION: Any = None
+
 VOCAB_SIZE = 256
 PAD_TOKEN_ID = 0
 BOS_TOKEN_ID = 1
@@ -37,6 +44,7 @@ EOS_TOKEN_ID = 2
 SEP_TOKEN_ID = 3
 NUM_ERROR_CLASSES = 8  # 0 = valid token, 1..7 = seeded error class
 IGNORE_LABEL = -100
+VARLEN_DISPATCH_THRESHOLD = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -147,37 +155,159 @@ class SlowTokenizerDataset(Dataset[tuple[Tensor, Tensor]]):
 
 @dataclass
 class PreparedBatch:
-    mode: str                         # 'dense', 'varlen', 'block_sparse'
+    mode: str                         # 'dense', 'varlen', 'packed_varlen', 'block_sparse', 'flex_block_sparse'
     input_ids: Tensor                 # (B, S) or (T_real,)
     position_ids: Tensor              # (B, S) or (T_real,)
     labels: Tensor                    # (B, S) or (T_real,)
     seq_id: Tensor | None = None      # (B, S): 0=pad, 1..K=packed sequence id within row
-    cu_seqlens: Tensor | None = None  # (N_seq + 1,) int64 offsets for jagged varlen
+    cu_seqlens: Tensor | None = None  # (N_seq + 1,) int32 (CUDA) / int64 (CPU) cumulative offsets
+    max_seqlen: int = 0               # maximum single-sequence length within batch
+    token_weights: Tensor | None = None  # optional per-token / curriculum weights matching labels shape
+    block_mask: Any = None            # optional cached FlexAttention BlockMask for static packed rows
     seq_lens: list[int] = field(default_factory=list)
     real_tokens: int = 0
     total_tokens: int = 0
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "PreparedBatch":
+        cu_out: Tensor | None = None
+        if self.cu_seqlens is not None:
+            target_dtype = torch.int32 if device.type == "cuda" else self.cu_seqlens.dtype
+            cu_out = self.cu_seqlens.to(device=device, dtype=target_dtype, non_blocking=non_blocking)
+        cached_bm = self.block_mask
+        if cached_bm is not None:
+            bm_kv = getattr(cached_bm, "kv_num_blocks", None)
+            if bm_kv is not None and bm_kv.device != device:
+                cached_bm = None
         return PreparedBatch(
             mode=self.mode,
             input_ids=self.input_ids.to(device, non_blocking=non_blocking),
             position_ids=self.position_ids.to(device, non_blocking=non_blocking),
             labels=self.labels.to(device, non_blocking=non_blocking),
             seq_id=self.seq_id.to(device, non_blocking=non_blocking) if self.seq_id is not None else None,
-            cu_seqlens=self.cu_seqlens.to(device, non_blocking=non_blocking)
-            if self.cu_seqlens is not None
-            else None,
+            cu_seqlens=cu_out,
+            max_seqlen=self.max_seqlen,
+            token_weights=(
+                self.token_weights.to(device, non_blocking=non_blocking)
+                if self.token_weights is not None
+                else None
+            ),
+            block_mask=cached_bm,
             seq_lens=self.seq_lens,
             real_tokens=self.real_tokens,
             total_tokens=self.total_tokens,
         )
 
 
-def collate_padded_pairs(pairs: list[tuple[Tensor, Tensor]], pad_multiple: int = 1) -> PreparedBatch:
+def build_cu_seqlens(
+    seq_id_or_lens: Tensor | list[int] | tuple[int, ...],
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+    is_lengths: bool = False,
+) -> tuple[Tensor, int]:
+    """Build `(N_seq + 1,)` cumulative sequence offsets and `max_seqlen` in O(B * S) without dense masks.
+
+    Accepts either:
+      - `list[int]` / `tuple[int, ...]` of positive sequence lengths (or 1D Tensor with `is_lengths=True`), or
+      - a `(B, S)` or `(S,)` `seq_id` tensor where contiguous runs of identical `seq_id > 0` within each row
+        denote packed sequences (`0` = pad).
+    """
+    if isinstance(seq_id_or_lens, (list, tuple)) or is_lengths:
+        lens = (
+            [int(x) for x in seq_id_or_lens.tolist()]
+            if isinstance(seq_id_or_lens, Tensor)
+            else [int(x) for x in seq_id_or_lens]
+        )
+        for idx, ln in enumerate(lens):
+            if ln <= 0:
+                raise ValueError(f"Sequence {idx} length must be >= 1, got {ln}")
+        dev = torch.device(device) if device is not None else torch.device("cpu")
+        out_dtype = dtype if dtype is not None else (torch.int32 if dev.type == "cuda" else torch.int64)
+        offsets = [0]
+        acc = 0
+        max_s = 0
+        for ln in lens:
+            acc += ln
+            offsets.append(acc)
+            if ln > max_s:
+                max_s = ln
+        return torch.tensor(offsets, dtype=out_dtype, device=dev), max_s
+
+    if not isinstance(seq_id_or_lens, Tensor):
+        raise TypeError(f"Expected Tensor or sequence of ints, got {type(seq_id_or_lens).__name__}")
+
+    sid = seq_id_or_lens.unsqueeze(0) if seq_id_or_lens.ndim == 1 else seq_id_or_lens
+    if sid.ndim != 2:
+        raise ValueError(f"seq_id must be 1D or 2D, got shape {tuple(seq_id_or_lens.shape)}")
+
+    dev = torch.device(device) if device is not None else sid.device
+    out_dtype = dtype if dtype is not None else (torch.int32 if dev.type == "cuda" else torch.int64)
+
+    _b, s = sid.shape
+    active = sid > 0
+    is_start = torch.zeros_like(sid, dtype=torch.bool)
+    if s > 0:
+        is_start[:, 0] = active[:, 0]
+    if s > 1:
+        is_start[:, 1:] = active[:, 1:] & (sid[:, 1:] != sid[:, :-1])
+
+    starts_active = is_start[active]
+    t_real = int(starts_active.numel())
+    if t_real == 0:
+        return torch.zeros((1,), dtype=out_dtype, device=dev), 0
+
+    start_pos = torch.nonzero(starts_active, as_tuple=False).flatten()
+    end_pos = torch.tensor([t_real], dtype=start_pos.dtype, device=sid.device)
+    cu = torch.cat([start_pos, end_pos], dim=0)
+    seg_lens = cu[1:] - cu[:-1]
+    max_s = int(seg_lens.max().item()) if seg_lens.numel() > 0 else 0
+    return cu.to(device=dev, dtype=out_dtype), max_s
+
+
+def chunk_sequence_pairs(
+    pairs: list[tuple[Tensor, Tensor]],
+    chunk_len: int,
+) -> list[tuple[Tensor, Tensor]]:
+    """Split oversized `(tokens, labels)` sequence pairs cleanly into contiguous chunks `<= chunk_len`."""
+    if chunk_len < 1:
+        raise ValueError(f"chunk_len must be >= 1, got {chunk_len}")
+    chunked: list[tuple[Tensor, Tensor]] = []
+    for seq_idx, (tok, lbl) in enumerate(pairs):
+        raw_len = int(tok.numel())
+        if int(lbl.numel()) != raw_len:
+            raise ValueError(
+                f"Sequence {seq_idx} token/label length mismatch: {raw_len} vs {int(lbl.numel())}"
+            )
+        if raw_len <= 0:
+            raise ValueError(f"Sequence {seq_idx} must be non-empty, got length {raw_len}")
+        for start in range(0, raw_len, chunk_len):
+            end = min(start + chunk_len, raw_len)
+            chunked.append((tok[start:end], lbl[start:end]))
+    return chunked
+
+
+def collate_padded_pairs(
+    pairs: list[tuple[Tensor, Tensor]],
+    pad_multiple: int = 1,
+    max_seq_len: int | None = None,
+) -> PreparedBatch:
     """Pad a list of (tokens, labels) tensors to the max length in the batch."""
+    if not pairs:
+        raise ValueError("pairs must be non-empty")
     b = len(pairs)
-    lens = [int(t.numel()) for t, _ in pairs]
-    max_s = max(lens)
+    lens: list[int] = []
+    for seq_idx, (tok, lbl) in enumerate(pairs):
+        n = int(tok.numel())
+        if int(lbl.numel()) != n:
+            raise ValueError(f"Sequence {seq_idx} token/label length mismatch: {n} vs {int(lbl.numel())}")
+        if n <= 0:
+            raise ValueError(f"Sequence {seq_idx} must have length >= 1, got {n}")
+        if max_seq_len is not None and n > max_seq_len:
+            raise ValueError(f"Sequence {seq_idx} length {n} exceeds max_seq_len={max_seq_len}")
+        lens.append(n)
+
+    max_len = max(lens)
+    max_s = max_len
     if pad_multiple > 1:
         max_s = ((max_s + pad_multiple - 1) // pad_multiple) * pad_multiple
 
@@ -187,7 +317,7 @@ def collate_padded_pairs(pairs: list[tuple[Tensor, Tensor]], pad_multiple: int =
     seq_id = torch.zeros((b, max_s), dtype=torch.int64)
 
     for i, (tok, lbl) in enumerate(pairs):
-        n = int(tok.numel())
+        n = lens[i]
         input_ids[i, :n] = tok
         position_ids[i, :n] = torch.arange(n, dtype=torch.int64)
         labels[i, :n] = lbl
@@ -199,6 +329,7 @@ def collate_padded_pairs(pairs: list[tuple[Tensor, Tensor]], pad_multiple: int =
         position_ids=position_ids,
         labels=labels,
         seq_id=seq_id,
+        max_seqlen=max_len,
         seq_lens=lens,
         real_tokens=sum(lens),
         total_tokens=b * max_s,
@@ -211,89 +342,154 @@ def pack_sequence_pairs(
     rows_per_batch: int = 4,
     attn_mode: str = "dense",
     truncate: bool = False,
+    overflow_policy: str = "raise",
+    curriculum_weights: list[float] | tuple[float, ...] | None = None,
 ) -> list[PreparedBatch]:
-    """First-fit / greedy bin-pack sequences into fixed-length rows of `pack_len`.
+    """First-fit / greedy bin-pack sequences into fixed-capacity bins of `pack_len`.
 
-    Resets `position_ids` to `0..len-1` per packed sequence and tags each sequence with a
-    distinct `seq_id >= 1` (`0` = trailing pad) for exact block-diagonal attention masking.
-    Raises ValueError if any sequence exceeds `pack_len` unless `truncate=True`.
+    Resets `position_ids` to `0..len-1` per packed sequence. When `attn_mode == 'packed_varlen'`,
+    emits unpadded 1D `(T_real,)` tensors with cumulative `cu_seqlens` and `max_seqlen <= pack_len`
+    for zero-padding varlen FlashAttention / jagged SDPA without allocating dense `(B, 1, S, S)` masks.
+    Raises ValueError if any sequence is empty (`<= 0`) or exceeds `pack_len` under `overflow_policy='raise'`.
     """
     if pack_len < 1:
         raise ValueError(f"pack_len must be >= 1, got {pack_len}")
     if rows_per_batch < 1:
         raise ValueError(f"rows_per_batch must be >= 1, got {rows_per_batch}")
+    valid_modes = ("dense", "packed_varlen", "varlen", "block_sparse", "flex_block_sparse")
+    if attn_mode not in valid_modes:
+        raise ValueError(f"Unsupported attn_mode={attn_mode!r}; expected one of {valid_modes}")
 
-    rows_tok: list[Tensor] = []
-    rows_pos: list[Tensor] = []
-    rows_lbl: list[Tensor] = []
-    rows_sid: list[Tensor] = []
-    rows_lens: list[list[int]] = []
+    effective_policy = "truncate" if (truncate and overflow_policy == "raise") else overflow_policy
+    if effective_policy not in ("raise", "truncate", "chunk", "quarantine"):
+        raise ValueError(
+            f"Unsupported overflow_policy={effective_policy!r}; expected 'raise', 'truncate', 'chunk', or 'quarantine'"
+        )
+    if curriculum_weights is not None and len(curriculum_weights) != len(pairs):
+        raise ValueError(
+            f"curriculum_weights length {len(curriculum_weights)} != pairs length {len(pairs)}"
+        )
 
-    # Open bins tracking remaining capacity
-    bins_used: list[int] = []
-    bins_next_sid: list[int] = []
-
+    normalized_items: list[tuple[Tensor, Tensor, float | None]] = []
     for seq_idx, (tok, lbl) in enumerate(pairs):
         raw_len = int(tok.numel())
         if int(lbl.numel()) != raw_len:
             raise ValueError(
                 f"Sequence {seq_idx} token/label length mismatch: {raw_len} vs {int(lbl.numel())}"
             )
-        if raw_len > pack_len and not truncate:
-            raise ValueError(
-                f"Sequence {seq_idx} has length {raw_len} > pack_len={pack_len}; "
-                "pass truncate=True to allow truncation"
-            )
-        n = min(raw_len, pack_len) if truncate else raw_len
-        tok = tok[:n]
-        lbl = lbl[:n]
+        if raw_len <= 0:
+            raise ValueError(f"Sequence {seq_idx} must have length >= 1, got {raw_len}")
+        cw = float(curriculum_weights[seq_idx]) if curriculum_weights is not None else None
+        if raw_len > pack_len:
+            if effective_policy == "raise":
+                raise ValueError(
+                    f"Sequence {seq_idx} has length {raw_len} > pack_len={pack_len}; "
+                    "pass truncate=True or overflow_policy='chunk'|'quarantine'"
+                )
+            if effective_policy == "truncate":
+                normalized_items.append((tok[:pack_len], lbl[:pack_len], cw))
+            elif effective_policy == "chunk":
+                for start in range(0, raw_len, pack_len):
+                    end = min(start + pack_len, raw_len)
+                    normalized_items.append((tok[start:end], lbl[start:end], cw))
+            elif effective_policy == "quarantine":
+                continue
+        else:
+            normalized_items.append((tok, lbl, cw))
 
+    # First-fit bin assignment tracking slices per bin without allocating O(S^2) masks
+    bins_used: list[int] = []
+    bins_entries: list[list[tuple[Tensor, Tensor, float | None]]] = []
+
+    for tok, lbl, cw in normalized_items:
+        n = int(tok.numel())
         placed = -1
         for b_idx, used in enumerate(bins_used):
             if used + n <= pack_len:
                 placed = b_idx
                 break
-
         if placed < 0:
             placed = len(bins_used)
             bins_used.append(0)
-            bins_next_sid.append(1)
-            rows_tok.append(torch.full((pack_len,), PAD_TOKEN_ID, dtype=torch.int64))
-            rows_pos.append(torch.zeros((pack_len,), dtype=torch.int64))
-            rows_lbl.append(torch.full((pack_len,), IGNORE_LABEL, dtype=torch.int64))
-            rows_sid.append(torch.zeros((pack_len,), dtype=torch.int64))
-            rows_lens.append([])
-
-        start = bins_used[placed]
-        sid = bins_next_sid[placed]
-        rows_tok[placed][start : start + n] = tok
-        rows_pos[placed][start : start + n] = torch.arange(n, dtype=torch.int64)
-        rows_lbl[placed][start : start + n] = lbl
-        rows_sid[placed][start : start + n] = sid
-        rows_lens[placed].append(n)
-
+            bins_entries.append([])
+        bins_entries[placed].append((tok, lbl, cw))
         bins_used[placed] += n
-        bins_next_sid[placed] += 1
 
     batches: list[PreparedBatch] = []
-    for i in range(0, len(rows_tok), rows_per_batch):
-        chunk_tok = torch.stack(rows_tok[i : i + rows_per_batch], dim=0)
-        chunk_pos = torch.stack(rows_pos[i : i + rows_per_batch], dim=0)
-        chunk_lbl = torch.stack(rows_lbl[i : i + rows_per_batch], dim=0)
-        chunk_sid = torch.stack(rows_sid[i : i + rows_per_batch], dim=0)
-        flat_lens = [ln for sub in rows_lens[i : i + rows_per_batch] for ln in sub]
-        batches.append(
-            PreparedBatch(
-                mode=attn_mode,
-                input_ids=chunk_tok,
-                position_ids=chunk_pos,
-                labels=chunk_lbl,
-                seq_id=chunk_sid,
-                seq_lens=flat_lens,
-                real_tokens=sum(flat_lens),
-                total_tokens=int(chunk_tok.numel()),
+    is_varlen_pack = attn_mode in ("packed_varlen", "varlen")
+
+    for i in range(0, len(bins_entries), rows_per_batch):
+        bin_group = bins_entries[i : i + rows_per_batch]
+        flat_entries = [entry for b_list in bin_group for entry in b_list]
+        flat_lens = [int(t.numel()) for t, _, _ in flat_entries]
+        real_toks = sum(flat_lens)
+
+        if is_varlen_pack:
+            toks_1d = torch.cat([t for t, _, _ in flat_entries], dim=0)
+            lbls_1d = torch.cat([lbl for _, lbl, _ in flat_entries], dim=0)
+            pos_1d = torch.cat([torch.arange(ln, dtype=torch.int64) for ln in flat_lens], dim=0)
+            cu_seq, max_s = build_cu_seqlens(flat_lens)
+            tw_1d: Tensor | None = None
+            if curriculum_weights is not None:
+                tw_1d = torch.cat(
+                    [
+                        torch.full((int(t.numel()),), float(cw or 0.0), dtype=torch.bfloat16)
+                        for t, _, cw in flat_entries
+                    ],
+                    dim=0,
+                )
+            batches.append(
+                PreparedBatch(
+                    mode=attn_mode,
+                    input_ids=toks_1d,
+                    position_ids=pos_1d,
+                    labels=lbls_1d,
+                    seq_id=None,
+                    cu_seqlens=cu_seq,
+                    max_seqlen=max_s,
+                    token_weights=tw_1d,
+                    seq_lens=flat_lens,
+                    real_tokens=real_toks,
+                    total_tokens=real_toks,
+                )
             )
-        )
+        else:
+            num_rows = len(bin_group)
+            chunk_tok = torch.full((num_rows, pack_len), PAD_TOKEN_ID, dtype=torch.int64)
+            chunk_pos = torch.zeros((num_rows, pack_len), dtype=torch.int64)
+            chunk_lbl = torch.full((num_rows, pack_len), IGNORE_LABEL, dtype=torch.int64)
+            chunk_sid = torch.zeros((num_rows, pack_len), dtype=torch.int64)
+            chunk_tw = (
+                torch.zeros((num_rows, pack_len), dtype=torch.bfloat16)
+                if curriculum_weights is not None
+                else None
+            )
+            for r_idx, b_list in enumerate(bin_group):
+                cursor = 0
+                for sid_idx, (tok, lbl, cw) in enumerate(b_list, start=1):
+                    n = int(tok.numel())
+                    chunk_tok[r_idx, cursor : cursor + n] = tok
+                    chunk_pos[r_idx, cursor : cursor + n] = torch.arange(n, dtype=torch.int64)
+                    chunk_lbl[r_idx, cursor : cursor + n] = lbl
+                    chunk_sid[r_idx, cursor : cursor + n] = sid_idx
+                    if chunk_tw is not None:
+                        chunk_tw[r_idx, cursor : cursor + n] = float(cw or 0.0)
+                    cursor += n
+
+            batches.append(
+                PreparedBatch(
+                    mode=attn_mode,
+                    input_ids=chunk_tok,
+                    position_ids=chunk_pos,
+                    labels=chunk_lbl,
+                    seq_id=chunk_sid,
+                    max_seqlen=max(flat_lens, default=0),
+                    token_weights=chunk_tw,
+                    seq_lens=flat_lens,
+                    real_tokens=real_toks,
+                    total_tokens=int(chunk_tok.numel()),
+                )
+            )
     return batches
 
 
@@ -318,13 +514,27 @@ class PackCollate:
         return collate_pack_for_dataloader(pairs, pack_len=self.pack_len)
 
 
-def collate_varlen_pairs(pairs: list[tuple[Tensor, Tensor]]) -> PreparedBatch:
+def collate_varlen_pairs(
+    pairs: list[tuple[Tensor, Tensor]],
+    max_seq_len: int | None = None,
+) -> PreparedBatch:
     """Concatenate sequences into 1D flat tensors + jagged offsets (zero padding)."""
-    lens = [int(t.numel()) for t, _ in pairs]
+    if not pairs:
+        raise ValueError("pairs must be non-empty")
+    lens: list[int] = []
+    for seq_idx, (t, lbl) in enumerate(pairs):
+        n = int(t.numel())
+        if int(lbl.numel()) != n:
+            raise ValueError(f"Sequence {seq_idx} token/label length mismatch: {n} vs {int(lbl.numel())}")
+        if n <= 0:
+            raise ValueError(f"Sequence {seq_idx} must have length >= 1, got {n}")
+        if max_seq_len is not None and n > max_seq_len:
+            raise ValueError(f"Sequence {seq_idx} length {n} exceeds max_seq_len={max_seq_len}")
+        lens.append(n)
     toks = torch.cat([t for t, _ in pairs], dim=0)
     lbls = torch.cat([lbl for _, lbl in pairs], dim=0)
     pos = torch.cat([torch.arange(n, dtype=torch.int64) for n in lens], dim=0)
-    offsets = torch.tensor([0] + list(np.cumsum(lens)), dtype=torch.int64)
+    offsets, max_s = build_cu_seqlens(lens)
     total = int(toks.numel())
     return PreparedBatch(
         mode="varlen",
@@ -332,6 +542,7 @@ def collate_varlen_pairs(pairs: list[tuple[Tensor, Tensor]]) -> PreparedBatch:
         position_ids=pos,
         labels=lbls,
         cu_seqlens=offsets,
+        max_seqlen=max_s,
         seq_lens=lens,
         real_tokens=total,
         total_tokens=total,
@@ -345,7 +556,7 @@ def build_batches_from_items(
     pack_len: int = 512,
     pack_rows_per_batch: int = 3,
 ) -> list[PreparedBatch]:
-    """Pre-build batches for compute-side ablations: padded, bucketed, packed, varlen, block_sparse."""
+    """Pre-build batches for compute-side ablations: padded, bucketed, packed, packed_varlen, varlen, block_sparse."""
     pairs = [
         (
             torch.tensor(it.tokens, dtype=torch.int64),
@@ -370,6 +581,11 @@ def build_batches_from_items(
     if strategy == "packed":
         return pack_sequence_pairs(
             pairs, pack_len=pack_len, rows_per_batch=pack_rows_per_batch, attn_mode="dense"
+        )
+
+    if strategy == "packed_varlen":
+        return pack_sequence_pairs(
+            pairs, pack_len=pack_len, rows_per_batch=pack_rows_per_batch, attn_mode="packed_varlen"
         )
 
     if strategy == "block_sparse":
@@ -527,19 +743,17 @@ def tiled_local_global_attention(
     return out_blk.view(b, n_blk, h, w, d).permute(0, 2, 1, 3, 4).reshape(b, h, s, d)
 
 
-def flex_local_global_attention(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
+def build_flex_block_mask(
     seq_id: Tensor,
     block_size: int = 64,
     num_global_tokens: int = 4,
     causal: bool = False,
-) -> Tensor:
-    """PyTorch FlexAttention execution path matching `tiled_local_global_attention` semantics."""
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+    compile_mask: bool = False,
+) -> Any:
+    """Prebuild and return a reusable PyTorch FlexAttention `BlockMask` for a `(B, S)` `seq_id` tensor."""
+    from torch.nn.attention.flex_attention import create_block_mask
 
-    b, _h, s, _d = q.shape
+    b, s = seq_id.shape
     w = block_size
     g_cnt = min(num_global_tokens, w)
     seq_starts = _sequence_start_offsets(seq_id)
@@ -560,15 +774,65 @@ def flex_local_global_attention(
             same = same & (kv_idx <= q_idx)
         return torch.where(is_pad_q, q_idx == kv_idx, same)
 
-    bm = create_block_mask(
+    return create_block_mask(
         mask_mod,
         B=b,
         H=None,
         Q_LEN=s,
         KV_LEN=s,
-        device=str(q.device),
-        _compile=False,
+        device=str(seq_id.device),
+        _compile=compile_mask,
     )
+
+
+def _get_flex_attention_fn(use_compile: bool) -> Any:
+    """Return compiled `flex_attention` on CUDA (with clean eager fallback) or eager on CPU."""
+    global _COMPILED_FLEX_ATTENTION
+    from torch.nn.attention.flex_attention import flex_attention
+
+    if not use_compile:
+        return flex_attention
+    if _COMPILED_FLEX_ATTENTION is None:
+        try:
+            _COMPILED_FLEX_ATTENTION = torch.compile(flex_attention)
+        except Exception:
+            return flex_attention
+    return _COMPILED_FLEX_ATTENTION
+
+
+def flex_local_global_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    seq_id: Tensor,
+    block_size: int = 64,
+    num_global_tokens: int = 4,
+    causal: bool = False,
+    block_mask: Any = None,
+    compile_flex: bool | None = None,
+) -> Tensor:
+    """PyTorch FlexAttention execution path matching `tiled_local_global_attention` semantics."""
+    from torch.nn.attention.flex_attention import flex_attention
+
+    bm = (
+        block_mask
+        if block_mask is not None
+        else build_flex_block_mask(
+            seq_id=seq_id,
+            block_size=block_size,
+            num_global_tokens=num_global_tokens,
+            causal=causal,
+            compile_mask=False,
+        )
+    )
+    should_compile = (q.device.type == "cuda") if compile_flex is None else compile_flex
+    if should_compile:
+        fn = _get_flex_attention_fn(use_compile=True)
+        try:
+            return fn(q, k, v, block_mask=bm)
+        except Exception:
+            pass
+
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -612,6 +876,7 @@ class TransformerBlock(nn.Module):
         block_sparse: bool = False,
         use_flex: bool = False,
         block_size: int = 64,
+        block_mask: Any = None,
     ) -> Tensor:
         b, s, d = x.shape
         q, k, v = self.qkv(self.ln1(x)).chunk(3, dim=-1)
@@ -621,7 +886,13 @@ class TransformerBlock(nn.Module):
 
         if (use_flex or (block_sparse and self.use_flex_attention)) and seq_id is not None:
             attn_out = flex_local_global_attention(
-                q, k, v, seq_id=seq_id, block_size=block_size, causal=self.causal
+                q,
+                k,
+                v,
+                seq_id=seq_id,
+                block_size=block_size,
+                causal=self.causal,
+                block_mask=block_mask,
             )
         elif block_sparse and seq_id is not None:
             attn_out = tiled_local_global_attention(
@@ -636,11 +907,38 @@ class TransformerBlock(nn.Module):
         x = x + self.ffn(self.ln2(x))
         return x
 
-    def forward_varlen(self, x: Tensor, cu_seqlens: Tensor) -> Tensor:
-        t_tok, d = x.shape
-        q_raw, k_raw, v_raw = self.qkv(self.ln1(x)).chunk(3, dim=-1)
+    def _run_varlen_qkv(
+        self,
+        q_raw: Tensor,
+        k_raw: Tensor,
+        v_raw: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int | None = None,
+    ) -> Tensor:
+        t_tok, d = q_raw.shape
+        if t_tok == 0 or cu_seqlens.numel() <= 1:
+            return q_raw.new_zeros((t_tok, d))
 
-        if self.causal and x.device.type != "cuda":
+        if (
+            _FLASH_ATTN_VARLEN_FUNC is not None
+            and q_raw.device.type == "cuda"
+            and q_raw.dtype in (torch.float16, torch.bfloat16)
+        ):
+            cu_i32 = cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
+            eff_max = (
+                int(max_seqlen)
+                if max_seqlen is not None and max_seqlen > 0
+                else int((cu_i32[1:] - cu_i32[:-1]).max().item())
+            )
+            q_h = q_raw.contiguous().view(t_tok, self.n_heads, self.d_head)
+            k_h = k_raw.contiguous().view(t_tok, self.n_heads, self.d_head)
+            v_h = v_raw.contiguous().view(t_tok, self.n_heads, self.d_head)
+            attn_fa = _FLASH_ATTN_VARLEN_FUNC(
+                q_h, k_h, v_h, cu_i32, cu_i32, eff_max, eff_max, causal=self.causal
+            )
+            return attn_fa.reshape(t_tok, d)
+
+        if self.causal and q_raw.device.type != "cuda":
             # PyTorch's CPU math nested_tensor SDPA backend rejects `is_causal=True`;
             # run exact zero-padding per-segment SDPA over `cu_seqlens` slices on CPU.
             q_h = q_raw.contiguous().view(t_tok, self.n_heads, self.d_head)
@@ -663,31 +961,63 @@ class TransformerBlock(nn.Module):
                     is_causal=True,
                 )
                 outs.append(seg_out.squeeze(0).transpose(0, 1).contiguous().view(-1, d))
-            attn_flat = torch.cat(outs, dim=0) if outs else x.new_zeros((0, d))
-        else:
-            # Nested tensors require contiguous storage before transpose(1, 2)
-            q_nt = torch.nested.nested_tensor_from_jagged(
-                q_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
-            ).transpose(1, 2)
-            k_nt = torch.nested.nested_tensor_from_jagged(
-                k_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
-            ).transpose(1, 2)
-            v_nt = torch.nested.nested_tensor_from_jagged(
-                v_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
-            ).transpose(1, 2)
+            return torch.cat(outs, dim=0) if outs else q_raw.new_zeros((0, d))
 
-            # PyTorch's CPU jagged SDPA internally converts jagged -> strided nested_tensor,
-            # triggering a prototype UserWarning even when inputs already use layout=torch.jagged.
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"The PyTorch API of nested tensors is in prototype stage.*",
-                    category=UserWarning,
-                )
-                attn_nt = F.scaled_dot_product_attention(q_nt, k_nt, v_nt, is_causal=self.causal)
-            attn_flat = attn_nt.transpose(1, 2).values().contiguous().view(t_tok, d)
+        # Nested tensors require contiguous storage before transpose(1, 2)
+        q_nt = torch.nested.nested_tensor_from_jagged(
+            q_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
+        ).transpose(1, 2)
+        k_nt = torch.nested.nested_tensor_from_jagged(
+            k_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
+        ).transpose(1, 2)
+        v_nt = torch.nested.nested_tensor_from_jagged(
+            v_raw.contiguous().view(t_tok, self.n_heads, self.d_head), cu_seqlens
+        ).transpose(1, 2)
 
+        # PyTorch's CPU jagged SDPA internally converts jagged -> strided nested_tensor,
+        # triggering a prototype UserWarning even when inputs already use layout=torch.jagged.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"The PyTorch API of nested tensors is in prototype stage.*",
+                category=UserWarning,
+            )
+            attn_nt = F.scaled_dot_product_attention(q_nt, k_nt, v_nt, is_causal=self.causal)
+        return attn_nt.transpose(1, 2).values().contiguous().view(t_tok, d)
+
+    def forward_varlen(
+        self,
+        x: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int | None = None,
+    ) -> Tensor:
+        q_raw, k_raw, v_raw = self.qkv(self.ln1(x)).chunk(3, dim=-1)
+        attn_flat = self._run_varlen_qkv(q_raw, k_raw, v_raw, cu_seqlens, max_seqlen=max_seqlen)
         x = x + self.out_proj(attn_flat)
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+    def forward_packed_segmented(
+        self,
+        x: Tensor,
+        active_mask: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int | None = None,
+    ) -> Tensor:
+        """Execute dense `(B, S, D)` packed rows via `cu_seqlens` without O(B * S^2) mask allocation."""
+        q_raw, k_raw, v_raw = self.qkv(self.ln1(x)).chunk(3, dim=-1)
+        # Pad slots self-attend with weight 1.0 under build_block_diag_mask -> exact output is v_raw
+        attn_full = v_raw.clone()
+        if cu_seqlens.numel() > 1:
+            attn_act = self._run_varlen_qkv(
+                q_raw[active_mask],
+                k_raw[active_mask],
+                v_raw[active_mask],
+                cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+            attn_full[active_mask] = attn_act.to(attn_full.dtype)
+        x = x + self.out_proj(attn_full)
         x = x + self.ffn(self.ln2(x))
         return x
 
@@ -707,8 +1037,10 @@ class ProtocolTransformer(nn.Module):
         causal: bool = False,
         block_size: int = 64,
         use_flex_attention: bool = False,
+        varlen_dispatch_threshold: int = VARLEN_DISPATCH_THRESHOLD,
     ) -> None:
         super().__init__()
+        self.max_seq_len = max_seq_len
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_layers = n_layers
@@ -717,6 +1049,7 @@ class ProtocolTransformer(nn.Module):
         self.causal = causal
         self.block_size = block_size
         self.use_flex_attention = use_flex_attention
+        self.varlen_dispatch_threshold = varlen_dispatch_threshold
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
@@ -735,6 +1068,22 @@ class ProtocolTransformer(nn.Module):
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, num_classes)
 
+    def _validate_position_ids(self, position_ids: Tensor) -> None:
+        max_pos_allowed = self.pos_emb.num_embeddings
+        if torch.compiler.is_compiling():
+            return
+        if position_ids.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            return
+        if position_ids.numel() == 0:
+            return
+        min_pos = int(position_ids.min().item())
+        max_pos = int(position_ids.max().item())
+        if min_pos < 0 or max_pos >= max_pos_allowed:
+            raise ValueError(
+                f"position_ids out of range [0, {max_pos_allowed - 1}]: got min={min_pos}, max={max_pos}; "
+                f"increase max_seq_len (currently {max_pos_allowed}) or chunk sequences cleanly"
+            )
+
     def forward(
         self,
         input_ids: Tensor,
@@ -742,21 +1091,74 @@ class ProtocolTransformer(nn.Module):
         seq_id: Tensor | None = None,
         cu_seqlens: Tensor | None = None,
         mode: str = "dense",
+        max_seqlen: int | None = None,
+        block_mask: Any = None,
+        chunk_oversized: bool = False,
     ) -> Tensor:
-        x = self.tok_emb(input_ids) + self.pos_emb(position_ids.clamp(0, self.pos_emb.num_embeddings - 1))
+        max_pos_allowed = self.pos_emb.num_embeddings
+        if (
+            chunk_oversized
+            and mode == "dense"
+            and input_ids.ndim == 2
+            and input_ids.shape[1] > max_pos_allowed
+        ):
+            outs: list[Tensor] = []
+            s_total = input_ids.shape[1]
+            for start in range(0, s_total, max_pos_allowed):
+                end = min(start + max_pos_allowed, s_total)
+                sub_pos = torch.remainder(position_ids[:, start:end], max_pos_allowed)
+                sub_sid = seq_id[:, start:end] if seq_id is not None else None
+                outs.append(
+                    self.forward(
+                        input_ids[:, start:end],
+                        sub_pos,
+                        seq_id=sub_sid,
+                        mode="dense",
+                        chunk_oversized=False,
+                    )
+                )
+            return torch.cat(outs, dim=1)
 
-        if mode == "varlen":
+        self._validate_position_ids(position_ids)
+        x = self.tok_emb(input_ids) + self.pos_emb(position_ids)
+
+        if mode in ("varlen", "packed_varlen"):
             if cu_seqlens is None:
-                raise ValueError("cu_seqlens is required when mode='varlen'")
+                raise ValueError(f"cu_seqlens is required when mode={mode!r}")
             for blk in self.blocks:
-                x = blk.forward_varlen(x, cu_seqlens)
+                x = blk.forward_varlen(x, cu_seqlens, max_seqlen=max_seqlen)
             return self.head(self.ln_f(x))
 
         use_flex = mode == "flex_block_sparse"
         block_sparse = mode in ("block_sparse", "flex_block_sparse")
+
+        is_capturing = input_ids.device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+        if (
+            not block_sparse
+            and seq_id is not None
+            and input_ids.ndim == 2
+            and input_ids.shape[1] >= self.varlen_dispatch_threshold
+            and not is_capturing
+            and not torch.compiler.is_compiling()
+        ):
+            active_mask = seq_id > 0
+            cu_seg, seg_max = build_cu_seqlens(seq_id)
+            for blk in self.blocks:
+                x = blk.forward_packed_segmented(x, active_mask, cu_seg, max_seqlen=seg_max)
+            return self.head(self.ln_f(x))
+
         attn_mask = None
         if not block_sparse and seq_id is not None:
             attn_mask = build_block_diag_mask(seq_id, causal=self.causal)
+
+        shared_bm = block_mask
+        if (use_flex or (block_sparse and self.use_flex_attention)) and seq_id is not None and shared_bm is None:
+            shared_bm = build_flex_block_mask(
+                seq_id=seq_id,
+                block_size=self.block_size,
+                causal=self.causal,
+                compile_mask=False,
+            )
 
         for blk in self.blocks:
             x = blk.forward_dense(
@@ -766,13 +1168,226 @@ class ProtocolTransformer(nn.Module):
                 block_sparse=block_sparse,
                 use_flex=use_flex,
                 block_size=self.block_size,
+                block_mask=shared_bm,
             )
         return self.head(self.ln_f(x))
 
 
+def _per_sequence_inv_len_weights(
+    labels: Tensor,
+    active: Tensor,
+    *,
+    seq_id: Tensor | None = None,
+    cu_seqlens: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Compute `(tok_inv_len, num_active_seqs)` without host-device sync (`CUDA Graph` & `compile` safe)."""
+    active_f = active.to(torch.float32)
+
+    if cu_seqlens is not None:
+        seg_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
+        n_segs = int(seg_lens.numel())
+        if n_segs == 0 or labels.numel() == 0:
+            return torch.zeros_like(active_f), torch.zeros((), dtype=torch.float32, device=labels.device)
+        seg_ids = torch.repeat_interleave(
+            torch.arange(n_segs, device=labels.device, dtype=torch.int64), seg_lens
+        )
+        counts = torch.zeros(n_segs, dtype=torch.float32, device=labels.device)
+        counts.scatter_add_(0, seg_ids, active_f.reshape(-1))
+        inv_len = torch.where(counts > 0, 1.0 / counts.clamp(min=1.0), torch.zeros_like(counts))
+        tok_inv_len = inv_len[seg_ids].reshape(labels.shape) * active_f
+        k_seqs = (counts > 0).sum().to(torch.float32)
+        return tok_inv_len, k_seqs
+
+    if seq_id is not None:
+        sid2d = seq_id.unsqueeze(0) if seq_id.ndim == 1 else seq_id
+        act2d = active.unsqueeze(0) if active.ndim == 1 else active
+        valid2d = act2d & (sid2d > 0)
+        b_dim, s_dim = sid2d.shape
+        is_new = torch.zeros_like(sid2d, dtype=torch.bool)
+        if s_dim > 0:
+            is_new[:, 0] = sid2d[:, 0] > 0
+        if s_dim > 1:
+            is_new[:, 1:] = (sid2d[:, 1:] > 0) & (sid2d[:, 1:] != sid2d[:, :-1])
+        run_id = is_new.reshape(-1).to(torch.int64).cumsum(dim=0)
+        valid_flat = valid2d.reshape(-1)
+        bucket = torch.where(valid_flat, run_id, torch.zeros_like(run_id))
+        counts = torch.zeros(b_dim * s_dim + 1, dtype=torch.float32, device=labels.device)
+        counts.scatter_add_(0, bucket, valid_flat.to(torch.float32))
+        counts[0] = 0.0
+        inv_len = torch.where(counts > 0, 1.0 / counts.clamp(min=1.0), torch.zeros_like(counts))
+        tok_inv_len = (inv_len[bucket] * valid_flat.to(torch.float32)).reshape(labels.shape)
+        k_seqs = (counts > 0).sum().to(torch.float32)
+        return tok_inv_len, k_seqs
+
+    if labels.ndim == 2:
+        row_counts = active_f.sum(dim=1, keepdim=True)
+        tok_inv_len = torch.where(
+            row_counts > 0, active_f / row_counts.clamp(min=1.0), torch.zeros_like(active_f)
+        )
+        k_seqs = (row_counts.squeeze(1) > 0).sum().to(torch.float32)
+        return tok_inv_len, k_seqs
+
+    total_cnt = active_f.sum()
+    tok_inv_len = torch.where(
+        total_cnt > 0, active_f / total_cnt.clamp(min=1.0), torch.zeros_like(active_f)
+    )
+    k_seqs = (total_cnt > 0).to(torch.float32)
+    return tok_inv_len, k_seqs
+
+
+def packed_sequence_ce_loss(
+    logits: Tensor,
+    labels: Tensor,
+    loss_reduction: str = "sequence_mean",
+    *,
+    seq_id: Tensor | None = None,
+    cu_seqlens: Tensor | None = None,
+    token_weights: Tensor | None = None,
+    fixed_denom: float | None = None,
+    ignore_index: int = IGNORE_LABEL,
+) -> Tensor:
+    """Compute cross-entropy loss over packed variable-length protocol sequences without length bias.
+
+    Supported `loss_reduction` modes:
+      - `'sequence_mean'`       : normalizes each packed sequence `i` by `1 / (K_b * s_i)` so co-packed
+                                  short and long protocols contribute equally per example (and incorporates
+                                  `token_weights` per sequence when supplied).
+      - `'curriculum_weighted'` : multiplies per-token losses by `token_weights` (e.g. `curriculum_weights_bf16`
+                                  `p * (1 - p)`) normalized over active weighted mass (and length-normalized
+                                  per sequence when `seq_id` or `cu_seqlens` is provided).
+      - `'token_mean'`          : legacy flat active-token mean reduction.
+      - `'fixed_horizon'`       : divides summed active loss by constant `fixed_denom` to avoid tail-batch LR spikes.
+    """
+    logits_f32 = logits.float()
+    if labels.numel() == 0:
+        return logits_f32.sum() * 0.0
+
+    tok_loss = F.cross_entropy(
+        logits_f32.reshape(-1, logits_f32.shape[-1]),
+        labels.reshape(-1),
+        ignore_index=ignore_index,
+        reduction="none",
+    ).reshape(labels.shape)
+
+    active = labels != ignore_index
+    active_f = active.to(torch.float32)
+
+    if loss_reduction == "token_mean":
+        if token_weights is not None:
+            w = token_weights.to(device=labels.device, dtype=torch.float32).reshape(labels.shape) * active_f
+            denom = w.sum()
+            return torch.where(denom > 0, (tok_loss * w).sum() / denom.clamp(min=1e-12), logits_f32.sum() * 0.0)
+        denom = active_f.sum()
+        return torch.where(denom > 0, (tok_loss * active_f).sum() / denom.clamp(min=1.0), logits_f32.sum() * 0.0)
+
+    if loss_reduction == "fixed_horizon":
+        denom_val = float(fixed_denom) if fixed_denom is not None else float(max(labels.numel(), 1))
+        if denom_val <= 0.0:
+            raise ValueError(f"fixed_denom must be > 0, got {denom_val}")
+        if token_weights is not None:
+            w = token_weights.to(device=labels.device, dtype=torch.float32).reshape(labels.shape) * active_f
+            return (tok_loss * w).sum() / denom_val
+        return (tok_loss * active_f).sum() / denom_val
+
+    if loss_reduction == "sequence_mean":
+        tok_inv_len, k_seqs = _per_sequence_inv_len_weights(
+            labels, active, seq_id=seq_id, cu_seqlens=cu_seqlens
+        )
+        if token_weights is not None:
+            cw = token_weights.to(device=labels.device, dtype=torch.float32).reshape(labels.shape)
+            w = tok_inv_len * cw
+            denom = w.sum()
+            return torch.where(denom > 0, (tok_loss * w).sum() / denom.clamp(min=1e-12), logits_f32.sum() * 0.0)
+        return torch.where(
+            k_seqs > 0, (tok_loss * tok_inv_len).sum() / k_seqs.clamp(min=1.0), logits_f32.sum() * 0.0
+        )
+
+    if loss_reduction == "curriculum_weighted":
+        if token_weights is None:
+            raise ValueError("token_weights is required when loss_reduction='curriculum_weighted'")
+        cw = token_weights.to(device=labels.device, dtype=torch.float32).reshape(labels.shape) * active_f
+        if seq_id is not None or cu_seqlens is not None:
+            tok_inv_len, _ = _per_sequence_inv_len_weights(
+                labels, active, seq_id=seq_id, cu_seqlens=cu_seqlens
+            )
+            w = tok_inv_len * cw
+        else:
+            w = cw
+        denom = w.sum()
+        return torch.where(denom > 0, (tok_loss * w).sum() / denom.clamp(min=1e-12), logits_f32.sum() * 0.0)
+
+    raise ValueError(
+        f"Unsupported loss_reduction={loss_reduction!r}; expected 'sequence_mean', "
+        "'curriculum_weighted', 'token_mean', or 'fixed_horizon'"
+    )
+
+
+compute_packed_loss = packed_sequence_ce_loss
+
+
 # ---------------------------------------------------------------------------
-# 4. Analytic FLOP counter, FlexAttention probe, CUDA Graph runner, and profiler
+# 4. Analytic FLOP counter, GPU peak lookup, FlexAttention probe, CUDA Graph runner, and profiler
 # ---------------------------------------------------------------------------
+
+
+_GPU_PEAK_FLOPS_TABLE: tuple[tuple[tuple[str, ...], float, float, float], ...] = (
+    # (substring_tokens, bf16_tflops, tf32_tflops, fp32_tflops) - dense non-sparse vendor specs
+    (("h200",), 989.5, 494.7, 67.0),
+    (("h100", "nvl"), 835.0, 417.5, 60.0),
+    (("h100", "pcie"), 756.5, 378.2, 51.2),
+    (("h800", "pcie"), 756.5, 378.2, 51.2),
+    (("h100",), 989.5, 494.7, 67.0),
+    (("h800",), 989.5, 494.7, 67.0),
+    (("a100",), 312.0, 156.0, 19.5),
+    (("a800",), 312.0, 156.0, 19.5),
+    (("l40s",), 362.05, 181.0, 91.6),
+    (("l40",), 181.05, 90.5, 90.5),
+    (("rtx 4090",), 330.3, 82.6, 82.6),
+    (("rtx 3090",), 142.0, 35.6, 35.6),
+    (("a10g",), 125.0, 62.5, 31.2),
+    (("a10",), 125.0, 62.5, 31.2),
+    (("l4",), 121.0, 60.5, 30.3),
+)
+
+
+def detect_gpu_peak_flops(
+    gpu_name: str | None,
+    precision: str = "bf16",
+    override_tflops: float | None = None,
+) -> tuple[float | None, str]:
+    """Return `(peak_flops_per_sec, description)` from `--peak-tflops` override or NVIDIA datasheet lookup."""
+    if override_tflops is not None:
+        if override_tflops <= 0.0:
+            raise ValueError(f"override_tflops must be > 0, got {override_tflops}")
+        return float(override_tflops) * 1e12, f"manual override ({override_tflops:.2f} TFLOPS)"
+
+    if not gpu_name:
+        return None, "N/A"
+    lowered = gpu_name.strip().lower()
+    if lowered in ("", "none", "none (cpu only)", "cpu"):
+        return None, "N/A"
+
+    prec = precision.lower()
+    if "v100" in lowered:
+        if prec == "fp16":
+            return 125.0e12, "NVIDIA V100 FP16 Tensor Core (125.0 TFLOPS)"
+        if prec == "fp32":
+            return 15.7e12, "NVIDIA V100 FP32 (15.7 TFLOPS)"
+        return None, "N/A (V100 lacks native BF16 Tensor Cores; pass --peak-tflops)"
+
+    for tokens, bf16_tf, tf32_tf, fp32_tf in _GPU_PEAK_FLOPS_TABLE:
+        if all(tok in lowered for tok in tokens):
+            if prec in ("bf16", "fp16"):
+                val = bf16_tf
+            elif prec == "tf32":
+                val = tf32_tf
+            elif prec == "fp32":
+                val = fp32_tf
+            else:
+                raise ValueError(f"Unsupported precision={precision!r}")
+            return val * 1e12, f"{gpu_name} {prec.upper()} peak ({val:.2f} TFLOPS)"
+
+    return None, f"N/A (unknown GPU peak for {gpu_name!r}; pass --peak-tflops)"
 
 
 def count_batch_training_flops(
@@ -799,7 +1414,7 @@ def count_batch_training_flops(
         attn_pairs_real = float(sum(s * s for s in batch.seq_lens))
     useful_fwd = linear_fwd_per_tok * real_toks + float(4 * n_l * d) * attn_pairs_real
 
-    if batch.mode == "varlen":
+    if batch.mode in ("varlen", "packed_varlen"):
         exec_fwd = useful_fwd
     elif batch.mode in ("block_sparse", "flex_block_sparse"):
         b_rows, s_len = batch.input_ids.shape
@@ -812,7 +1427,9 @@ def count_batch_training_flops(
         ) * eff_kv
     else:
         b_rows, s_len = batch.input_ids.shape
-        if batch.seq_id is None and model.causal:
+        if batch.seq_id is not None and s_len >= model.varlen_dispatch_threshold:
+            attn_pairs_exec = attn_pairs_real
+        elif batch.seq_id is None and model.causal:
             attn_pairs_exec = 0.5 * float(b_rows) * float(s_len) * float(s_len + 1)
         else:
             attn_pairs_exec = float(b_rows * s_len * s_len)
@@ -824,7 +1441,13 @@ def count_batch_training_flops(
 def probe_flex_attention(device: str | torch.device | None = None) -> dict[str, Any]:
     """Check whether PyTorch FlexAttention supports forward and backward on `device`."""
     dev = default_device(device)
-    info: dict[str, Any] = {"device": str(dev), "forward_ok": False, "backward_ok": False, "note": ""}
+    info: dict[str, Any] = {
+        "device": str(dev),
+        "forward_ok": False,
+        "backward_ok": False,
+        "compiled_ok": False,
+        "note": "",
+    }
     try:
         from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
@@ -834,17 +1457,29 @@ def probe_flex_attention(device: str | torch.device | None = None) -> dict[str, 
         bm = create_block_mask(
             local_win, B=None, H=None, Q_LEN=128, KV_LEN=128, device=str(dev), _compile=False
         )
+        dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
                 message=r"flex_attention called without torch\.compile\(\).*",
                 category=UserWarning,
             )
-            q_fwd = torch.randn(2, 4, 128, 32, device=dev, requires_grad=False)
+            q_fwd = torch.randn(2, 4, 128, 32, device=dev, dtype=dtype, requires_grad=False)
             _ = flex_attention(q_fwd, q_fwd, q_fwd, block_mask=bm)
             info["forward_ok"] = True
 
             q_bwd = q_fwd.detach().clone().requires_grad_(True)
+            if dev.type == "cuda":
+                try:
+                    compiled_fn = _get_flex_attention_fn(use_compile=True)
+                    out = compiled_fn(q_bwd, q_bwd, q_bwd, block_mask=bm)
+                    out.sum().backward()
+                    info["backward_ok"] = True
+                    info["compiled_ok"] = True
+                    info["note"] = "Compiled FlexAttention forward+backward supported"
+                    return info
+                except Exception:
+                    q_bwd = q_fwd.detach().clone().requires_grad_(True)
             out = flex_attention(q_bwd, q_bwd, q_bwd, block_mask=bm)
             out.sum().backward()
             info["backward_ok"] = True
@@ -864,6 +1499,7 @@ class CudaGraphStepRunner:
         pack_rows: int,
         pack_len: int,
         use_bf16: bool = True,
+        loss_reduction: str = "sequence_mean",
         device: torch.device | None = None,
     ) -> None:
         dev = default_device(device)
@@ -873,11 +1509,13 @@ class CudaGraphStepRunner:
         self.model = model
         self.optimizer = optimizer
         self.use_bf16 = use_bf16
+        self.loss_reduction = loss_reduction
 
         self.static_input_ids = torch.zeros((pack_rows, pack_len), dtype=torch.int64, device=dev)
         self.static_pos_ids = torch.zeros((pack_rows, pack_len), dtype=torch.int64, device=dev)
         self.static_seq_id = torch.ones((pack_rows, pack_len), dtype=torch.int64, device=dev)
         self.static_labels = torch.zeros((pack_rows, pack_len), dtype=torch.int64, device=dev)
+        self.static_token_weights = torch.ones((pack_rows, pack_len), dtype=torch.float32, device=dev)
         self.static_loss = torch.zeros((), dtype=torch.float32, device=dev)
         self.graph = torch.cuda.CUDAGraph()
         self._captured = False
@@ -891,10 +1529,14 @@ class CudaGraphStepRunner:
                 seq_id=self.static_seq_id,
                 mode="dense",
             )
-            loss = F.cross_entropy(
-                logits.view(-1, logits.shape[-1]),
-                self.static_labels.view(-1),
-                ignore_index=IGNORE_LABEL,
+            static_tw = getattr(self, "static_token_weights", None)
+            loss_red = getattr(self, "loss_reduction", "sequence_mean")
+            loss = packed_sequence_ce_loss(
+                logits,
+                self.static_labels,
+                loss_reduction=loss_red,
+                seq_id=self.static_seq_id,
+                token_weights=static_tw,
             )
         loss.backward()
         self.optimizer.step()
@@ -918,6 +1560,13 @@ class CudaGraphStepRunner:
                 f"Batch shape {tuple(batch.input_ids.shape)} != captured static shape "
                 f"{tuple(self.static_input_ids.shape)}"
             )
+        mdl = getattr(self, "model", None)
+        if mdl is not None and batch.seq_lens:
+            max_allowed = mdl.pos_emb.num_embeddings
+            if max(batch.seq_lens) > max_allowed:
+                raise ValueError(
+                    f"Batch max sequence length {max(batch.seq_lens)} exceeds model max_seq_len={max_allowed}"
+                )
         if not self._captured:
             self.capture()
         self.static_input_ids.copy_(batch.input_ids, non_blocking=True)
@@ -927,6 +1576,12 @@ class CudaGraphStepRunner:
         else:
             self.static_seq_id.fill_(1)
         self.static_labels.copy_(batch.labels, non_blocking=True)
+        static_tw = getattr(self, "static_token_weights", None)
+        if static_tw is not None:
+            if batch.token_weights is not None:
+                static_tw.copy_(batch.token_weights.to(dtype=torch.float32), non_blocking=True)
+            else:
+                static_tw.fill_(1.0)
         self.graph.replay()
         return float(self.static_loss.item())
 
@@ -955,8 +1610,9 @@ def run_torch_profiler_summary(
     model: ProtocolTransformer,
     batch: PreparedBatch,
     use_bf16: bool = False,
+    loss_reduction: str = "sequence_mean",
 ) -> list[dict[str, Any]]:
-    """Run one `torch.profiler.profile` step and extract the top 5 CPU/CUDA ops by self time."""
+    """Run one `torch.profiler.profile` step and extract top 5 ops (sorted by CUDA time on GPU, CPU time on CPU)."""
     dev = next(model.parameters()).device
     b_dev = batch.to(dev)
     activities = [torch.profiler.ProfilerActivity.CPU]
@@ -975,25 +1631,39 @@ def run_torch_profiler_summary(
                 seq_id=b_dev.seq_id,
                 cu_seqlens=b_dev.cu_seqlens,
                 mode=b_dev.mode,
+                max_seqlen=b_dev.max_seqlen,
+                block_mask=b_dev.block_mask,
             )
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                b_dev.labels.reshape(-1),
-                ignore_index=IGNORE_LABEL,
+            loss = packed_sequence_ce_loss(
+                logits,
+                b_dev.labels,
+                loss_reduction=loss_reduction,
+                seq_id=b_dev.seq_id,
+                cu_seqlens=b_dev.cu_seqlens,
+                token_weights=b_dev.token_weights,
             )
         loss.backward()
         opt.step()
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
 
-    events = sorted(
-        prof.key_averages(),
-        key=lambda e: float(getattr(e, "self_cpu_time_total", 0.0)),
-        reverse=True,
-    )[:5]
+    def _device_us(ev: Any) -> float:
+        return float(
+            getattr(ev, "self_device_time_total", getattr(ev, "self_cuda_time_total", 0.0))
+        )
+
+    sort_fn = (
+        (lambda e: (_device_us(e), float(getattr(e, "self_cpu_time_total", 0.0))))
+        if dev.type == "cuda"
+        else (lambda e: float(getattr(e, "self_cpu_time_total", 0.0)))
+    )
+    events = sorted(prof.key_averages(), key=sort_fn, reverse=True)[:5]
     return [
         {
             "op": ev.key,
             "calls": int(ev.count),
-            "self_cpu_ms": round(float(ev.self_cpu_time_total) / 1000.0, 3),
+            "self_cpu_ms": round(float(getattr(ev, "self_cpu_time_total", 0.0)) / 1000.0, 3),
+            "self_cuda_ms": round(_device_us(ev) / 1000.0, 3),
         }
         for ev in events
     ]
@@ -1009,6 +1679,8 @@ def _execute_timed_batches(
     warmup_steps: int = 1,
     max_steps: int | None = None,
     peak_flops: float | None = None,
+    mfu_na_label: str = "N/A",
+    loss_reduction: str = "sequence_mean",
     notes: str = "",
 ) -> AblationRow:
     opt = torch.optim.AdamW(base_model.parameters(), lr=3e-4)
@@ -1030,11 +1702,16 @@ def _execute_timed_batches(
                 seq_id=wb_d.seq_id,
                 cu_seqlens=wb_d.cu_seqlens,
                 mode=wb_d.mode,
+                max_seqlen=wb_d.max_seqlen,
+                block_mask=wb_d.block_mask,
             )
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                wb_d.labels.reshape(-1),
-                ignore_index=IGNORE_LABEL,
+            loss = packed_sequence_ce_loss(
+                logits,
+                wb_d.labels,
+                loss_reduction=loss_reduction,
+                seq_id=wb_d.seq_id,
+                cu_seqlens=wb_d.cu_seqlens,
+                token_weights=wb_d.token_weights,
             )
         loss.backward()
         opt.step()
@@ -1066,6 +1743,11 @@ def _execute_timed_batches(
             torch.cuda.synchronize()
         t1 = time.perf_counter()
 
+        start_ev = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+        end_ev = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+        if start_ev is not None:
+            start_ev.record()
+
         opt.zero_grad(set_to_none=True)
         with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
             logits = model(
@@ -1074,23 +1756,32 @@ def _execute_timed_batches(
                 seq_id=batch_d.seq_id,
                 cu_seqlens=batch_d.cu_seqlens,
                 mode=batch_d.mode,
+                max_seqlen=batch_d.max_seqlen,
+                block_mask=batch_d.block_mask,
             )
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                batch_d.labels.reshape(-1),
-                ignore_index=IGNORE_LABEL,
+            loss = packed_sequence_ce_loss(
+                logits,
+                batch_d.labels,
+                loss_reduction=loss_reduction,
+                seq_id=batch_d.seq_id,
+                cu_seqlens=batch_d.cu_seqlens,
+                token_weights=batch_d.token_weights,
             )
         loss.backward()
         opt.step()
-        if device.type == "cuda":
+        if end_ev is not None and start_ev is not None:
+            end_ev.record()
             torch.cuda.synchronize()
-        t2 = time.perf_counter()
+            cp = float(start_ev.elapsed_time(end_ev)) / 1000.0
+            t2 = time.perf_counter()
+        else:
+            t2 = time.perf_counter()
+            cp = t2 - t1
 
         dw = t1 - t0
-        cp = t2 - t1
         data_waits.append(dw)
         computes.append(cp)
-        step_totals.append(t2 - t0)
+        step_totals.append(dw + cp if device.type == "cuda" else (t2 - t0))
 
         u_fl, e_fl = count_batch_training_flops(base_model, batch_d)
         total_useful_flops += u_fl
@@ -1106,14 +1797,14 @@ def _execute_timed_batches(
     n_s = max(len(step_totals), 1)
     achieved_u = total_useful_flops / wall
     achieved_e = total_exec_flops / wall
-    mfu_str = f"{100.0 * achieved_u / peak_flops:.2f}%" if peak_flops is not None else "N/A"
+    mfu_str = f"{100.0 * achieved_u / peak_flops:.2f}%" if peak_flops is not None else mfu_na_label
 
     return AblationRow(
         config=config_name,
         status="ok",
         real_tokens_per_sec=total_real / wall,
         useful_token_fraction=total_real / max(total_slots, 1),
-        step_time_ms=1000.0 * statistics.median(step_totals),
+        step_time_ms=1000.0 * statistics.median(step_totals) if step_totals else 0.0,
         data_wait_ms=1000.0 * (sum_dw / n_s),
         compute_ms=1000.0 * (sum_cp / n_s),
         data_wait_fraction=sum_dw / wall,
@@ -1128,7 +1819,7 @@ def _execute_timed_batches(
     )
 
 
-def _failed_row(config_name: str, exc: Exception) -> AblationRow:
+def _failed_row(config_name: str, exc: Exception, mfu_na_label: str = "N/A") -> AblationRow:
     """Record a config that raised instead of aborting the whole ablation."""
     short_err = (str(exc).splitlines() or [""])[0][:120]
     return AblationRow(
@@ -1142,7 +1833,7 @@ def _failed_row(config_name: str, exc: Exception) -> AblationRow:
         data_wait_fraction=0.0,
         useful_tflops_per_sec=0.0,
         executed_tflops_per_sec=0.0,
-        mfu="N/A",
+        mfu=mfu_na_label,
         speedup_vs_baseline=0.0,
         final_loss=float("nan"),
         notes=short_err,
@@ -1169,9 +1860,16 @@ def run_fill_gpu_ablation(
     peak_flops: float | None = None,
     seed: int = 0,
     device: str | torch.device | None = None,
+    include_varlen_bf16: bool | None = None,
+    loss_reduction: str = "sequence_mean",
+    mfu_na_label: str = "N/A",
 ) -> tuple[list[AblationRow], list[dict[str, Any]], dict[str, Any]]:
     """Run all Fill-One-GPU toggles and return (rows, profiler_top_ops, flex_probe)."""
     dev = default_device(device)
+    run_varlen_bf16 = (dev.type == "cuda") if include_varlen_bf16 is None else include_varlen_bf16
+    base_warmup = 2 if dev.type == "cuda" else 1
+    compile_warmup = 3
+
     items = generate_protocol_sequences(
         num_sequences=num_sequences,
         min_len=min(8, pack_len),
@@ -1199,13 +1897,24 @@ def run_fill_gpu_ablation(
     padded_batches = build_batches_from_items(items, "padded", batch_size=batch_size)
     m_a = fresh_model()
     row_a = _execute_timed_batches(
-        "a_padded_baseline", m_a, m_a, lambda: padded_batches, dev, use_bf16=False, peak_flops=peak_flops
+        "a_padded_baseline",
+        m_a,
+        m_a,
+        lambda: padded_batches,
+        dev,
+        use_bf16=False,
+        warmup_steps=base_warmup,
+        peak_flops=peak_flops,
+        mfu_na_label=mfu_na_label,
+        loss_reduction=loss_reduction,
     )
     rows.append(row_a)
     base_tps = max(row_a.real_tokens_per_sec, 1e-6)
 
-    # Run torch.profiler snapshot on packed vs padded once
-    prof_ops = run_torch_profiler_summary(fresh_model(), padded_batches[0], use_bf16=False)
+    # Run torch.profiler snapshot once (sorted by CUDA time on GPU, CPU time on CPU)
+    prof_ops = run_torch_profiler_summary(
+        fresh_model(), padded_batches[0], use_bf16=(dev.type == "cuda"), loss_reduction=loss_reduction
+    )
 
     # (b) Length-bucketed batching
     bucket_batches = build_batches_from_items(items, "bucketed", batch_size=batch_size)
@@ -1218,7 +1927,10 @@ def run_fill_gpu_ablation(
             lambda: bucket_batches,
             dev,
             use_bf16=False,
+            warmup_steps=base_warmup,
             peak_flops=peak_flops,
+            mfu_na_label=mfu_na_label,
+            loss_reduction=loss_reduction,
         )
     )
 
@@ -1235,7 +1947,10 @@ def run_fill_gpu_ablation(
             lambda: packed_batches,
             dev,
             use_bf16=False,
+            warmup_steps=base_warmup,
             peak_flops=peak_flops,
+            mfu_na_label=mfu_na_label,
+            loss_reduction=loss_reduction,
         )
     )
 
@@ -1250,7 +1965,10 @@ def run_fill_gpu_ablation(
             lambda: varlen_batches,
             dev,
             use_bf16=False,
+            warmup_steps=base_warmup,
             peak_flops=peak_flops,
+            mfu_na_label=mfu_na_label,
+            loss_reduction=loss_reduction,
             notes="PyTorch jagged nested_tensor + SDPA (is_causal=False)",
         )
     )
@@ -1265,7 +1983,10 @@ def run_fill_gpu_ablation(
             lambda: packed_batches,
             dev,
             use_bf16=True,
+            warmup_steps=base_warmup,
             peak_flops=peak_flops,
+            mfu_na_label=mfu_na_label,
+            loss_reduction=loss_reduction,
         )
     )
 
@@ -1280,11 +2001,61 @@ def run_fill_gpu_ablation(
             lambda: packed_batches,
             dev,
             use_bf16=True,
+            warmup_steps=compile_warmup,
             peak_flops=peak_flops,
+            mfu_na_label=mfu_na_label,
+            loss_reduction=loss_reduction,
         )
         rows.append(row_f)
     except Exception as exc:
-        rows.append(_failed_row("f_packed_torch_compile", exc))
+        rows.append(_failed_row("f_packed_torch_compile", exc, mfu_na_label=mfu_na_label))
+
+    # Optional / GPU BF16 packed_varlen (flash_attn_varlen_func / jagged FlashAttention + torch.compile)
+    if run_varlen_bf16:
+        packed_varlen_batches = build_batches_from_items(
+            items, "packed_varlen", pack_len=pack_len, pack_rows_per_batch=pack_rows_per_batch
+        )
+        varlen_kernel_note = (
+            "flash_attn_varlen_func BF16"
+            if (_FLASH_ATTN_VARLEN_FUNC is not None and dev.type == "cuda")
+            else "BF16 packed_varlen jagged SDPA"
+        )
+        m_e2 = fresh_model()
+        rows.append(
+            _execute_timed_batches(
+                "e2_packed_varlen_bf16",
+                m_e2,
+                m_e2,
+                lambda: packed_varlen_batches,
+                dev,
+                use_bf16=True,
+                warmup_steps=base_warmup,
+                peak_flops=peak_flops,
+                mfu_na_label=mfu_na_label,
+                loss_reduction=loss_reduction,
+                notes=varlen_kernel_note,
+            )
+        )
+        m_f2_base = fresh_model()
+        try:
+            m_f2_compiled = torch.compile(m_f2_base)
+            rows.append(
+                _execute_timed_batches(
+                    "f2_varlen_bf16_compile",
+                    m_f2_compiled,
+                    m_f2_base,
+                    lambda: packed_varlen_batches,
+                    dev,
+                    use_bf16=True,
+                    warmup_steps=compile_warmup,
+                    peak_flops=peak_flops,
+                    mfu_na_label=mfu_na_label,
+                    loss_reduction=loss_reduction,
+                    notes=f"{varlen_kernel_note} + torch.compile",
+                )
+            )
+        except Exception as exc:
+            rows.append(_failed_row("f2_varlen_bf16_compile", exc, mfu_na_label=mfu_na_label))
 
     # (g1) Synchronous slow tokenizer (num_workers=0) vs (g2) Async DataLoader (num_workers=2, prefetch)
     slow_ds = SlowTokenizerDataset(items, slow_work_iters=slow_work_iters)
@@ -1306,7 +2077,10 @@ def run_fill_gpu_ablation(
             lambda: sync_loader,
             dev,
             use_bf16=True,
+            warmup_steps=base_warmup,
             peak_flops=peak_flops,
+            mfu_na_label=mfu_na_label,
+            loss_reduction=loss_reduction,
             notes="num_workers=0 with CPU tokenizer work",
         )
     )
@@ -1335,6 +2109,8 @@ def run_fill_gpu_ablation(
                 use_bf16=True,
                 warmup_steps=1,
                 peak_flops=peak_flops,
+                mfu_na_label=mfu_na_label,
+                loss_reduction=loss_reduction,
                 notes="num_workers=2 (spawn), prefetch_factor=2, pin_memory=(cuda)",
             )
         )
@@ -1348,17 +2124,33 @@ def run_fill_gpu_ablation(
     )
     if flex_info["backward_ok"]:
         try:
+            premasked_batches: list[PreparedBatch] = []
+            for sb in sparse_batches:
+                sb_dev = sb.to(dev, non_blocking=(dev.type == "cuda"))
+                assert sb_dev.seq_id is not None
+                sb_dev.block_mask = build_flex_block_mask(
+                    sb_dev.seq_id, block_size=64, num_global_tokens=4, causal=False
+                )
+                premasked_batches.append(sb_dev)
             m_h_flex = fresh_model(use_flex=True)
+            flex_note = (
+                "Compiled FlexAttention W=64+G=4 (cached BlockMask)"
+                if flex_info.get("compiled_ok")
+                else "FlexAttention W=64+G=4 (cached BlockMask)"
+            )
             rows.append(
                 _execute_timed_batches(
                     "h_block_sparse_bf16",
                     m_h_flex,
                     m_h_flex,
-                    lambda: sparse_batches,
+                    lambda: premasked_batches,
                     dev,
                     use_bf16=True,
+                    warmup_steps=(compile_warmup if flex_info.get("compiled_ok") else base_warmup),
                     peak_flops=peak_flops,
-                    notes="FlexAttention W=64+G=4 (fwd+bwd)",
+                    mfu_na_label=mfu_na_label,
+                    loss_reduction=loss_reduction,
+                    notes=flex_note,
                 )
             )
         except Exception as flex_exc:
@@ -1372,7 +2164,10 @@ def run_fill_gpu_ablation(
                     lambda: sparse_batches,
                     dev,
                     use_bf16=True,
+                    warmup_steps=base_warmup,
                     peak_flops=peak_flops,
+                    mfu_na_label=mfu_na_label,
+                    loss_reduction=loss_reduction,
                     notes=f"Tiled SDPA W=64+G=4 (FlexAttn fallback: {short_f})",
                 )
             )
@@ -1386,7 +2181,10 @@ def run_fill_gpu_ablation(
                 lambda: sparse_batches,
                 dev,
                 use_bf16=True,
+                warmup_steps=base_warmup,
                 peak_flops=peak_flops,
+                mfu_na_label=mfu_na_label,
+                loss_reduction=loss_reduction,
                 notes=f"Tiled SDPA W=64+G=4 ({flex_info['note'][:68]})",
             )
         )
@@ -1401,11 +2199,19 @@ def run_fill_gpu_ablation(
                 # optimizer.step() runs inside graph capture, which requires capturable=True
                 opt_i = torch.optim.AdamW(m_i.parameters(), lr=3e-4, capturable=True)
                 runner = CudaGraphStepRunner(
-                    m_i, opt_i, pack_rows=pack_rows_per_batch, pack_len=pack_len, use_bf16=True, device=dev
+                    m_i,
+                    opt_i,
+                    pack_rows=pack_rows_per_batch,
+                    pack_len=pack_len,
+                    use_bf16=True,
+                    loss_reduction=loss_reduction,
+                    device=dev,
                 )
                 runner.replay_step(full_packed[0].to(dev, non_blocking=True))
                 torch.cuda.synchronize()
-                t0 = time.perf_counter()
+                start_ev = torch.cuda.Event(enable_timing=True)
+                end_ev = torch.cuda.Event(enable_timing=True)
+                start_ev.record()
                 real_sum = 0
                 slot_sum = 0
                 u_sum = 0.0
@@ -1419,8 +2225,9 @@ def run_fill_gpu_ablation(
                     e_sum += ef
                     real_sum += bd.real_tokens
                     slot_sum += bd.total_tokens
+                end_ev.record()
                 torch.cuda.synchronize()
-                dt = max(time.perf_counter() - t0, 1e-9)
+                dt = max(float(start_ev.elapsed_time(end_ev)) / 1000.0, 1e-9)
                 rows.append(
                     AblationRow(
                         config="i_cuda_graphs",
@@ -1433,10 +2240,10 @@ def run_fill_gpu_ablation(
                         data_wait_fraction=0.0,
                         useful_tflops_per_sec=(u_sum / dt) / 1e12,
                         executed_tflops_per_sec=(e_sum / dt) / 1e12,
-                        mfu=f"{100.0 * (u_sum / dt) / peak_flops:.2f}%" if peak_flops else "N/A",
+                        mfu=f"{100.0 * (u_sum / dt) / peak_flops:.2f}%" if peak_flops else mfu_na_label,
                         speedup_vs_baseline=(real_sum / dt) / base_tps,
                         final_loss=loss_v,
-                        notes="CUDA Graph static replay",
+                        notes="CUDA Graph static replay (CUDA Event timed)",
                         real_tokens=real_sum,
                         total_tokens=slot_sum,
                     )
@@ -1454,14 +2261,14 @@ def run_fill_gpu_ablation(
                         data_wait_fraction=0.0,
                         useful_tflops_per_sec=0.0,
                         executed_tflops_per_sec=0.0,
-                        mfu="N/A",
+                        mfu=mfu_na_label,
                         speedup_vs_baseline=0.0,
                         final_loss=float("nan"),
                         notes=f"fewer than pack_rows_per_batch={pack_rows_per_batch} packed rows",
                     )
                 )
         except Exception as exc:
-            rows.append(_failed_row("i_cuda_graphs", exc))
+            rows.append(_failed_row("i_cuda_graphs", exc, mfu_na_label=mfu_na_label))
     else:
         rows.append(
             AblationRow(
@@ -1475,7 +2282,7 @@ def run_fill_gpu_ablation(
                 data_wait_fraction=0.0,
                 useful_tflops_per_sec=0.0,
                 executed_tflops_per_sec=0.0,
-                mfu="N/A",
+                mfu=mfu_na_label,
                 speedup_vs_baseline=0.0,
                 final_loss=float("nan"),
                 notes="GPU only, not yet measured",

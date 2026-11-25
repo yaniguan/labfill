@@ -22,12 +22,21 @@ Full code-level architecture, benchmark tables (`main` vs open PR branches), and
 - **Model**: Sync-free `(T, B)` state-machine checker (16 error codes), `M x K` (`K=24`) single-edit repair expander, bitmask DAG beam search + `R`-restart simulated annealing, 4-layer `d=256` `ProtocolTransformer` (dense packed, jagged `nested_tensor` SDPA, tiled `W=64+G=4` block-sparse), and `float32` plate solute advection.
 - **Training**: 10-point single-GPU saturation ablation (`a_padded_baseline` through `i_cuda_graphs`) with PaLM Appendix B useful-vs-executed FLOP accounting (`5.42x` CPU real-token speedup from sequence packing + `bf16` autocast on open PR `origin/cpu-benchmark-results`; GPU runs **not yet measured**).
 - **History**: Initial release `ae91eb3` on `main`, plus open PR branches `origin/cpu-benchmark-results` (`d1a7510`, 1-thread & 8-thread Xeon CPU benchmarks and `docs/DESIGN.md`) and `origin/review-fixes-nov18` (`55eb158`, block-sparse key deduplication, intent-preserving repair accounting, full Python checker final state).
-- **Unique Properties**: Exact `0.1 uL` volume and `A1..H12` well-index alignment with [`YLM`](https://github.com/yaniguan/YLM) LabLean, zero cross-sequence attention leakage under packing, and direct verifier-filtering interfaces for [`labbench-posttrain`](https://github.com/yaniguan/labbench-posttrain), [`twinstep`](https://github.com/yaniguan/twinstep), [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal), [`lab-verify`](https://github.com/yaniguan/lab-verify), [`labshift`](https://github.com/yaniguan/labshift), and [`stepbot`](https://github.com/yaniguan/stepbot).
+- **Unique Properties**: Exact `0.1 uL` volume and `A1..H12` well-index alignment with [`YLM`](https://github.com/yaniguan/YLM) LabLean, zero cross-sequence attention leakage under packing, and direct verifier-filtering interfaces for [`labbench-posttrain`](https://github.com/yaniguan/labbench-posttrain), [`twinstep`](https://github.com/yaniguan/twinstep), [`lab-attrib`](https://github.com/yaniguan/lab-attrib), [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal), [`lab-verify`](https://github.com/yaniguan/lab-verify), [`labshift`](https://github.com/yaniguan/labshift), and [`stepbot`](https://github.com/yaniguan/stepbot).
+
+## 15-Repository Auto-Lab Wire Contract (`autolab-wire/v1`)
+
+`autolab_wire.py` (`REPO_ID = "labfill"`, `LAYER = "L3"`) implements `process_packet(packet: dict) -> dict` for the 15-repository [Auto-Lab](https://github.com/yaniguan/auto-lab) closed-loop wire protocol:
+
+- **Upstream (`twinstep` & `lab-attrib`)**: Accepts `error_twins.token_lengths` (plus optional `prompt_lengths`, `pass_rates` / `rollout_rewards`, and `drop_zero_variance`) from [`twinstep`](https://github.com/yaniguan/twinstep) alongside post-execution causal blame and certified provenance from [`lab-attrib`](https://github.com/yaniguan/lab-attrib). Packets already marked `halted=True` pass through unchanged.
+- **Layer `L3` Packing & Formal Guard (`LabFillLean`)**: Packs variable-length protocol/twin sequences into fixed-capacity BF16 bins (`bin_cap`, default `512`, auto-aligning implicit capacity up to `2048` / `8192` on longer protocols and supporting `overflow_policy="halt" | "quarantine_oversized" | "promote_bin_cap" | "chunk"`) using `labfill.fill_gpu.pack_sequence_pairs`, O(`bin_cap`) `build_cu_seqlens` boundary verification, and `materialize_bf16_packed_batch` (with an exact pure-Python fallback if PyTorch is absent). Verifies the `LabFillLean` invariants (`0 < len`, `offset + len <= bin_cap`, pairwise distinct `seqId`s and non-overlapping intervals, and `sum(packed_slices) == sum(token_lengths)`), halting on any overlap or conservation mismatch with `halt_reason = "L3_LABFILL_PACK_BLOCK"` (`bin_count = 0`, `useful_token_ratio = 0.0`).
+- **Downstream (`labbench-posttrain`)**: Writes `packed_batch` (`bin_cap`, `bin_count`, `total_real_tokens`, `useful_token_ratio`, `zero_cross_seq_overlap`, `bins`, `cu_seqlens`, `bin_cu_seqlens`, `max_seqlen`, `loss_mask_spans`, `total_completion_tokens`), exposes `packed_batch_to_posttrain_tensors(...)`, and appends `trace` and `bottom_reasoning_traces` for [`labbench-posttrain`](https://github.com/yaniguan/labbench-posttrain) `SplitGuard` and SFT/MPO/DPO/GRPO/GDPO post-training.
 
 ## Repository Layout
 
 ```text
 labfill/
+├── autolab_wire.py          # 15-repo Auto-Lab wire node (autolab-wire/v1, Layer L3)
 ├── labfill/
 │   ├── __init__.py          # Public API exports
 │   ├── protocol.py          # LabStateBatch, ProtocolBatch, PCR & random generators (0.1 uL units)
@@ -37,13 +46,15 @@ labfill/
 │   ├── planner.py           # Checker-gated DAG beam search & parallel SA instrument scheduler
 │   ├── fill_gpu.py          # ProtocolTransformer, packing/varlen/block-sparse/FlexAttn/CUDA-Graph ablation
 │   └── plate.py             # Batched 96-well plate rehearsal & solute concentration tracking
+├── community_extensions/    # DAPO zero-variance filtering & curriculum BF16 bin packer
+├── lean/LabFillLean.lean    # Lean 4 proofs for packed-bin non-overlap & token conservation
 ├── recipes/                 # Runnable end-to-end recipes (01..05)
 ├── benchmarks/run_all.py    # Reproducible JSON + Markdown benchmark harness
 ├── docs/
 │   ├── ARCHITECTURE_AND_HISTORY.md
 │   ├── DESIGN.md
 │   └── related_work.md
-└── tests/                   # Differential checker, LabLean conformance, twin/repair, DAG/SA, packing, and plate tests
+└── tests/                   # Differential checker, LabLean conformance, twin/repair, DAG/SA, packing, wire & plate tests
 ```
 
 ## Recipes
