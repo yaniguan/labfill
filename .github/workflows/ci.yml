@@ -48,8 +48,8 @@ jobs:
         run: |
           curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
           echo "$HOME/.elan/bin" >> $GITHUB_PATH
-          "$HOME/.elan/bin/lake" --dir /tmp/YLM/lean build LabLean.Checker
-          "$HOME/.elan/bin/lake" --dir lean build
+          (cd /tmp/YLM/lean && "$HOME/.elan/bin/lake" build LabLean.Checker)
+          (cd lean && "$HOME/.elan/bin/lake" build)
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
