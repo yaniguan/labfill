@@ -217,8 +217,9 @@ def bench_recipe2(
         st_b, pr_b = make_error_twin(st_base, pr_base, et, seed=30 + idx)
         rates: list[float] = []
         rep_frac = 0.0
+        rr_ref = batched_repair(st_b, pr_b, num_edits=26, reference_protocols=pr_base)
         for _ in range(repeats):
-            rr = batched_repair(st_b, pr_b, num_edits=24)
+            rr = batched_repair(st_b, pr_b, num_edits=26)
             rates.append(rr.protocols_repaired_per_sec)
             rep_frac = rr.repair_rate
         med_rate = round(statistics.median(rates), 1)
@@ -228,6 +229,9 @@ def bench_recipe2(
                 "detection_recall": recall_rep.per_error_recall[et],
                 "primary_code_match": recall_rep.per_error_primary_code_match.get(et, "n/a"),
                 "repair_rate_k24": round(rep_frac, 4),
+                "passes_checker_after_1_edit": round(rep_frac, 4),
+                "exact_recovery_rate": round(rr_ref.exact_recovery_rate or 0.0, 4),
+                "mean_field_edit_distance": round(rr_ref.mean_field_edit_distance or 0.0, 3),
                 "repair_edit_type_counts": rr.edit_type_counts,
                 "fixed_only_by_intent_change": rr.num_fixed_only_by_intent_change,
                 "repair_cpu_proto_per_sec": med_rate if dev.type == "cpu" else "not yet measured",
@@ -320,7 +324,7 @@ def resolve_benchmark_peak_flops(
 
 def bench_recipe4(
     dev: torch.device,
-    repeats: int = 3,
+    repeats: int = 5,
     peak_flops: float | None = None,
     peak_tflops_override: float | None = None,
     smoke: bool = False,
@@ -379,6 +383,7 @@ def bench_recipe4(
             seed=r,
             device=dev,
             include_varlen_bf16=include_varlen_bf16,
+            include_obfd=True,
             mfu_na_label=mfu_na_label,
         )
         runs.append(rows)
@@ -386,21 +391,29 @@ def bench_recipe4(
             prof_ops = p_ops
             flex_info = f_info
 
-    # Aggregate median across repeats per config
+    # Aggregate median + [min, max] spread across repeats per config
     num_cfgs = len(runs[0])
     agg_rows: list[dict[str, Any]] = []
-    base_tps = statistics.median([runs[r][0].real_tokens_per_sec for r in range(repeats)])
 
     for c_i in range(num_cfgs):
         sample = runs[0][c_i]
         if sample.status != "ok":
             d = asdict(sample)
+            d["num_seeds"] = repeats
             d["real_tokens_per_sec"] = "not yet measured" if dev.type == "cuda" else 0.0
             d["gpu_tokens_per_sec"] = "—" if dev.type == "cuda" else "not yet measured"
             agg_rows.append(d)
             continue
 
-        med_tps = statistics.median([runs[r][c_i].real_tokens_per_sec for r in range(repeats)])
+        tps_vals = [runs[r][c_i].real_tokens_per_sec for r in range(repeats)]
+        spd_vals = [runs[r][c_i].speedup_vs_baseline for r in range(repeats)]
+        med_tps = statistics.median(tps_vals)
+        min_tps = min(tps_vals)
+        max_tps = max(tps_vals)
+        med_spd = statistics.median(spd_vals)
+        min_spd = min(spd_vals)
+        max_spd = max(spd_vals)
+
         med_utf = statistics.median([runs[r][c_i].useful_token_fraction for r in range(repeats)])
         med_step = statistics.median([runs[r][c_i].step_time_ms for r in range(repeats)])
         med_wait_ms = statistics.median([runs[r][c_i].data_wait_ms for r in range(repeats)])
@@ -420,7 +433,11 @@ def bench_recipe4(
             {
                 "config": sample.config,
                 "status": "ok",
+                "num_seeds": repeats,
                 "real_tokens_per_sec": round(med_tps, 1) if dev.type == "cpu" else "not yet measured",
+                "real_tokens_per_sec_range": (
+                    [round(min_tps, 1), round(max_tps, 1)] if dev.type == "cpu" else "not yet measured"
+                ),
                 "useful_token_fraction": round(med_utf, 4),
                 "step_time_ms": round(med_step, 1),
                 "data_wait_ms": round(med_wait_ms, 2),
@@ -429,14 +446,21 @@ def bench_recipe4(
                 "useful_tflops_per_sec": round(med_u_tflops, 4),
                 "executed_tflops_per_sec": round(med_e_tflops, 4),
                 "mfu": mfu_val,
-                "speedup_vs_baseline": round(med_tps / max(base_tps, 1e-6), 2),
+                "speedup_vs_baseline": round(med_spd, 2),
+                "speedup_min": round(min_spd, 2),
+                "speedup_max": round(max_spd, 2),
+                "speedup_range": [round(min_spd, 2), round(max_spd, 2)],
                 "final_loss": round(med_loss, 4),
                 "gpu_tokens_per_sec": round(med_tps, 1) if dev.type == "cuda" else "not yet measured",
+                "gpu_tokens_per_sec_range": (
+                    [round(min_tps, 1), round(max_tps, 1)] if dev.type == "cuda" else "not yet measured"
+                ),
                 "notes": sample.notes,
             }
         )
 
     return {
+        "num_seeds": repeats,
         "ablation": agg_rows,
         "peak_flops_per_sec": resolved_peak,
         "peak_flops_source": peak_desc,
@@ -546,16 +570,23 @@ def format_markdown_report(payload: dict[str, Any]) -> str:
         f"(GPU: `{_fmt_num(gk['gpu_candidates_per_sec'], ',.1f')}`)\n"
     )
     lines.append(
-        "Repair Rate counts only edits that keep every transfer and mix step; deleting or "
-        "redirecting one is reported separately and not counted.\n"
+        "Passes Checker (1 Edit) counts only edits that keep every transfer and mix step; "
+        "Exact Recovery measures exact equality with the pre-corruption protocol.\n"
     )
-    lines.append("| Error Type | Detection Recall | Repair Rate (K=24) | Winning Edits | Intent-Change Only | Repair CPU (proto/s) | Repair GPU (proto/s) |")
-    lines.append("|---|---:|---:|---|---:|---:|---|")
+    lines.append(
+        "| Error Type | Detection Recall | Passes Checker (1 Edit) | Exact Recovery | Mean Changed Fields | Winning Edits | Intent-Change Only | Repair CPU (proto/s) | Repair GPU (proto/s) |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---|---:|---:|---|")
     for tr in r2["twins_and_repair"]:
         edits = ", ".join(f"{k}: {v}" for k, v in tr.get("repair_edit_type_counts", {}).items()) or "—"
+        pass_rate = tr.get("passes_checker_after_1_edit", tr["repair_rate_k24"])
+        exact_rec = tr.get("exact_recovery_rate")
+        exact_str = f"{exact_rec:.1%}" if isinstance(exact_rec, (int, float)) else "n/a"
+        mean_df = tr.get("mean_field_edit_distance")
+        df_str = f"{mean_df:.2f}" if isinstance(mean_df, (int, float)) else "n/a"
         lines.append(
             f"| `{tr['error_type']}` | {tr['detection_recall']:.1%} | "
-            f"{tr['repair_rate_k24']:.1%} | {edits} | {tr.get('fixed_only_by_intent_change', 'n/a')} | "
+            f"{pass_rate:.1%} | {exact_str} | {df_str} | {edits} | {tr.get('fixed_only_by_intent_change', 'n/a')} | "
             f"{_fmt_num(tr['repair_cpu_proto_per_sec'], ',.1f')} | "
             f"{_fmt_num(tr['repair_gpu_proto_per_sec'], ',.1f')} |"
         )
@@ -582,19 +613,27 @@ def format_markdown_report(payload: dict[str, Any]) -> str:
 
     # Recipe 4
     r4 = payload["recipe4_fill_one_gpu"]
-    lines.append("## Recipe 4: Fill One GPU Ablation (4-layer d=256 Transformer, lognormal 8..512 tokens)\n")
+    n_seeds = r4.get("num_seeds", 3)
+    lines.append(
+        f"## Recipe 4: Fill One GPU Ablation (4-layer d=256 Transformer, lognormal 8..512 tokens, {n_seeds} seeds)\n"
+    )
     if r4.get("peak_flops_source") and r4.get("peak_flops_source") != "N/A":
         lines.append(f"- **MFU Peak Reference**: `{r4['peak_flops_source']}`\n")
     lines.append(
-        "| Config | Real tok/s (CPU) | Useful-token % | Step Time (ms) | Data-wait % | Speedup vs (a) | MFU | GPU tok/s | Notes |"
+        "| Config | Real tok/s (CPU) | Useful-token % | Step Time (ms) | Data-wait % | Speedup vs (a) [min, max] | MFU | GPU tok/s | Notes |"
     )
-    lines.append("|---|---:|---:|---:|---:|---:|---|---|---|")
+    lines.append("|---|---:|---:|---:|---:|---|---|---|---:|")
     for row in r4["ablation"]:
         if row["status"] == "ok":
+            spd_med = _fmt_num(row["speedup_vs_baseline"], ".2f", "x")
+            if "speedup_min" in row and "speedup_max" in row:
+                spd_cell = f"{spd_med} [{row['speedup_min']:.2f}x, {row['speedup_max']:.2f}x]"
+            else:
+                spd_cell = spd_med
             lines.append(
                 f"| `{row['config']}` | {_fmt_num(row['real_tokens_per_sec'], ',.1f')} | "
                 f"{row['useful_token_fraction'] * 100:.1f}% | {_fmt_num(row['step_time_ms'], '.1f')} | "
-                f"{row['data_wait_fraction'] * 100:.1f}% | {_fmt_num(row['speedup_vs_baseline'], '.2f', 'x')} | "
+                f"{row['data_wait_fraction'] * 100:.1f}% | {spd_cell} | "
                 f"{row['mfu']} | {_fmt_num(row['gpu_tokens_per_sec'], ',.1f')} | {row['notes'] or 'ok'} |"
             )
         else:
@@ -622,7 +661,7 @@ RECIPES = {
     "recipe1_validation": ("Recipe 1: Batched protocol validation", lambda dev: bench_recipe1(dev, repeats=5)),
     "recipe2_twins_and_factory": ("Recipe 2: Seeded-error twins, generate/check/keep, batched repair", lambda dev: bench_recipe2(dev, repeats=3)),
     "recipe3_planning_and_scheduling": ("Recipe 3: Step-DAG planning and instrument scheduling", lambda dev: bench_recipe3(dev, repeats=3)),
-    "recipe4_fill_one_gpu": ("Recipe 4: Fill one GPU ablation (median of 3 repeats)", lambda dev: bench_recipe4(dev, repeats=3)),
+    "recipe4_fill_one_gpu": ("Recipe 4: Fill one GPU ablation (median & min-max over 5 seeds)", lambda dev: bench_recipe4(dev, repeats=5)),
     "recipe5_plate_rehearsal": ("Recipe 5: Batched 96-well plate rehearsal", lambda dev: bench_recipe5(dev, repeats=3)),
 }
 
@@ -674,6 +713,7 @@ def assemble_payload(loaded: dict[str, dict[str, Any]]) -> dict[str, Any]:
 def build_recipe_runners(
     peak_tflops_override: float | None = None,
     smoke: bool = False,
+    recipe4_repeats: int = 5,
 ) -> dict[str, tuple[str, Any]]:
     if smoke:
         return {
@@ -705,8 +745,10 @@ def build_recipe_runners(
         "recipe2_twins_and_factory": ("Recipe 2: Seeded-error twins, generate/check/keep, batched repair", lambda dev: bench_recipe2(dev, repeats=3)),
         "recipe3_planning_and_scheduling": ("Recipe 3: Step-DAG planning and instrument scheduling", lambda dev: bench_recipe3(dev, repeats=3)),
         "recipe4_fill_one_gpu": (
-            "Recipe 4: Fill one GPU ablation (median of 3 repeats)",
-            lambda dev: bench_recipe4(dev, repeats=3, peak_tflops_override=peak_tflops_override),
+            f"Recipe 4: Fill one GPU ablation (median & min-max over {recipe4_repeats} seeds)",
+            lambda dev: bench_recipe4(
+                dev, repeats=recipe4_repeats, peak_tflops_override=peak_tflops_override
+            ),
         ),
         "recipe5_plate_rehearsal": ("Recipe 5: Batched 96-well plate rehearsal", lambda dev: bench_recipe5(dev, repeats=3)),
     }

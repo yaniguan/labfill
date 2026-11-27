@@ -1,0 +1,150 @@
+{
+  "machine": {
+    "date": "2026-11-26",
+    "device_type": "cpu",
+    "cpu_model": "AMD64 Family 26 Model 96 Stepping 0, AuthenticAMD",
+    "cpu_cores": 16,
+    "torch_num_threads": 1,
+    "cpu_isa_highlights": [],
+    "python_version": "3.11.15",
+    "torch_version": "2.14.0+cpu",
+    "cuda_version": null,
+    "flash_attn_available": false,
+    "numpy_version": "2.4.6",
+    "load_avg_1_5_15_at_start": null,
+    "cuda_available": false,
+    "gpu_name": "none (CPU only)",
+    "gpu_compute_capability": null,
+    "gpu_vram_mb": null,
+    "nvidia_smi_telemetry": null
+  },
+  "wall_sec": 14.42,
+  "result": {
+    "false_positive_rate_on_valid": 0.0,
+    "generate_check_keep": {
+      "num_candidates": 4096,
+      "kept_fraction": 0.771,
+      "cpu_candidates_per_sec": 17076.4,
+      "gpu_candidates_per_sec": "not yet measured",
+      "sample_rejection_counts": {
+        "no_tip": 308,
+        "tip_already_on": 166,
+        "bad_pipette": 164,
+        "same_container": 10,
+        "sealed": 13,
+        "not_sealed": 57,
+        "frozen": 85,
+        "not_enough": 32,
+        "bad_temp": 81,
+        "unbalanced": 22
+      }
+    },
+    "twins_and_repair": [
+      {
+        "error_type": "overflow",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "passes_checker_after_1_edit": 1.0,
+        "exact_recovery_rate": 0.0,
+        "mean_field_edit_distance": 1.438,
+        "repair_edit_type_counts": {
+          "clamp_volume": 128
+        },
+        "fixed_only_by_intent_change": 0,
+        "repair_cpu_proto_per_sec": 366.9,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "wrong_pipette",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "passes_checker_after_1_edit": 1.0,
+        "exact_recovery_rate": 1.0,
+        "mean_field_edit_distance": 0.0,
+        "repair_edit_type_counts": {
+          "set_pipette": 128
+        },
+        "fixed_only_by_intent_change": 0,
+        "repair_cpu_proto_per_sec": 402.3,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "missing_tip",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "passes_checker_after_1_edit": 1.0,
+        "exact_recovery_rate": 1.0,
+        "mean_field_edit_distance": 0.0,
+        "repair_edit_type_counts": {
+          "insert_step": 128
+        },
+        "fixed_only_by_intent_change": 0,
+        "repair_cpu_proto_per_sec": 355.1,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "skip_thaw",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "passes_checker_after_1_edit": 1.0,
+        "exact_recovery_rate": 0.3281,
+        "mean_field_edit_distance": 0.672,
+        "repair_edit_type_counts": {
+          "insert_step": 128
+        },
+        "fixed_only_by_intent_change": 0,
+        "repair_cpu_proto_per_sec": 343.0,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "sealed_plate",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "passes_checker_after_1_edit": 1.0,
+        "exact_recovery_rate": 1.0,
+        "mean_field_edit_distance": 0.0,
+        "repair_edit_type_counts": {
+          "delete_prior_seal": 128
+        },
+        "fixed_only_by_intent_change": 0,
+        "repair_cpu_proto_per_sec": 345.3,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "bad_temp",
+        "detection_recall": 1.0,
+        "primary_code_match": 1.0,
+        "repair_rate_k24": 1.0,
+        "passes_checker_after_1_edit": 1.0,
+        "exact_recovery_rate": 0.0078,
+        "mean_field_edit_distance": 1.117,
+        "repair_edit_type_counts": {
+          "fix_incubate": 128
+        },
+        "fixed_only_by_intent_change": 0,
+        "repair_cpu_proto_per_sec": 550.9,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      },
+      {
+        "error_type": "swapped_steps",
+        "detection_recall": 1.0,
+        "primary_code_match": "n/a",
+        "repair_rate_k24": 1.0,
+        "passes_checker_after_1_edit": 1.0,
+        "exact_recovery_rate": 1.0,
+        "mean_field_edit_distance": 0.0,
+        "repair_edit_type_counts": {
+          "swap_adjacent": 128
+        },
+        "fixed_only_by_intent_change": 0,
+        "repair_cpu_proto_per_sec": 344.1,
+        "repair_gpu_proto_per_sec": "not yet measured"
+      }
+    ]
+  }
+}

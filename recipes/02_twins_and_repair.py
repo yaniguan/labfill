@@ -43,16 +43,18 @@ def main() -> None:
     # 3. Batched K-edit repair search (deleting or redirecting a transfer/mix step is not a repair)
     st_base, pr_base = make_random_valid_protocols(128, seed=11, device=dev)
     print(
-        f"{'Broken Twin Type':<18s} | {'Repaired (K=24)':>16s} | {'Throughput (proto/s)':>20s} | "
-        f"{'Intent-change only':>18s} | Winning edits"
+        f"{'Broken Twin Type':<18s} | {'Passes (1 Edit)':>16s} | {'Exact Recovery':>14s} | "
+        f"{'Mean dFields':>12s} | {'Throughput (proto/s)':>20s} | Winning edits"
     )
-    print("-" * 112)
+    print("-" * 124)
     for et in TWIN_ERROR_TYPES:
         st_b, pr_b = make_error_twin(st_base, pr_base, et, seed=19)
-        rr = batched_repair(st_b, pr_b, num_edits=24)
+        rr = batched_repair(st_b, pr_b, num_edits=26, reference_protocols=pr_base)
+        ex_r = rr.exact_recovery_rate or 0.0
+        md_f = rr.mean_field_edit_distance or 0.0
         print(
             f"{et:<18s} | {rr.num_repaired:4d}/{rr.num_broken:<4d} ({rr.repair_rate:5.1%}) | "
-            f"{rr.protocols_repaired_per_sec:20,.0f} | {rr.num_fixed_only_by_intent_change:18d} | "
+            f"{ex_r:13.1%} | {md_f:12.2f} | {rr.protocols_repaired_per_sec:20,.0f} | "
             f"{rr.edit_type_counts}"
         )
 

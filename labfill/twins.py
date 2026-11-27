@@ -467,9 +467,11 @@ class RepairResult:
     """Outcome of `batched_repair`.
 
     `num_repaired` / `repair_rate` count only intent-preserving repairs: edits that never delete
-    or redirect a transfer, mix, incubate, thaw or centrifuge step. Protocols that only an
-    intent-changing edit could make pass are counted in `num_fixed_only_by_intent_change` and are
-    not in `repaired_mask`.
+    or redirect a transfer, mix, incubate, thaw or centrifuge step ("passes checker after 1 edit").
+    Protocols that only an intent-changing edit could make pass are counted in
+    `num_fixed_only_by_intent_change` and are not in `repaired_mask`.
+    When `reference_protocols` is supplied to `batched_repair`, `exact_recovery_rate` and
+    `mean_field_edit_distance` measure exact recovery against the pre-corruption protocols.
     """
 
     num_broken: int
@@ -483,10 +485,25 @@ class RepairResult:
     chosen_edit: Tensor  # (M,) int64 winning edit id, -1 if not repaired
     edit_type_counts: dict[str, int]  # winning edit kind -> number of repaired protocols
     num_fixed_only_by_intent_change: int
+    num_exact_recovered: int | None = None
+    exact_recovery_rate: float | None = None
+    mean_field_edit_distance: float | None = None
+    field_edit_distances: list[int] | None = None
 
 
 # Ops whose deletion (or redirection) changes what the protocol does, not just how it does it
 INTENT_OPS: tuple[int, ...] = (OP_TRANSFER, OP_MIX, OP_INCUBATE, OP_THAW, OP_CENTRIFUGE)
+COMMON_ASSAY_TEMPS_C: tuple[int, ...] = (37, 72, 25, 55, 95, 4)
+_STEP_COMPARE_FIELDS: tuple[str, ...] = (
+    "op",
+    "src",
+    "dst",
+    "vol",
+    "temp",
+    "duration",
+    "pipette",
+    "rpm",
+)
 
 
 def repair_edit_kind(edit_id: int) -> str:
@@ -495,16 +512,16 @@ def repair_edit_kind(edit_id: int) -> str:
         return "set_pipette"
     if edit_id < 8:
         return "clamp_volume"
-    if edit_id < 10:
+    if edit_id < 14:
         return "fix_incubate"
-    if edit_id == 10:
+    if edit_id == 14:
         return "delete_step"
-    if edit_id < 13:
+    if edit_id < 17:
         return "swap_adjacent"
-    if edit_id < 21:
-        return "insert_step"
-    if edit_id == 21:
+    if edit_id == 17:
         return "delete_prior_seal"
+    if edit_id < 24:
+        return "insert_step"
     return "redirect_dst"
 
 
@@ -512,7 +529,7 @@ def _propose_k_edits(
     init_state: LabStateBatch,
     broken_proto: ProtocolBatch,
     first_err_step: Tensor,
-    num_edits: int = 24,
+    num_edits: int = 26,
     state_at_err: LabStateBatch | None = None,
 ) -> tuple[LabStateBatch, ProtocolBatch]:
     """Expand M broken protocols into M * K single-edit repair candidates of length T + 1.
@@ -536,6 +553,9 @@ def _propose_k_edits(
     err_t = first_err_step[item_idx].clamp(0, broken_proto.max_steps - 1)
 
     def rows_for(eid: int) -> tuple[Tensor, Tensor]:
+        if eid >= k:
+            empty = torch.zeros((0,), dtype=torch.int64, device=dev)
+            return empty, empty
         mask = edit_id == eid
         r = mask.nonzero(as_tuple=False).squeeze(1)
         return r, err_t[r]
@@ -566,21 +586,21 @@ def _propose_k_edits(
             cand.vol[r, stp] = fit_vol[item_idx[r]].clamp(max=PIPETTE_RANGES_TENTHS_UL[pip][1])
             cand.pipette[r, stp] = pip
 
-    # Edits 8..9: fix bad incubation temperature / duration
-    for offset, tc in enumerate((37, 72)):
+    # Edits 8..13: fix bad incubation temperature / duration across canonical assay/PCR temps (4/25/37/55/72/95 C)
+    for offset, tc in enumerate(COMMON_ASSAY_TEMPS_C):
         r, stp = rows_for(8 + offset)
         if r.numel() > 0:
             cand.temp[r, stp] = tc
             cand.duration[r, stp] = cand.duration[r, stp].clamp(min=30)
 
-    # Edit 10: delete offending step (e.g. extra pick_tip, drop_tip, seal).
+    # Edit 14: delete offending step (e.g. extra pick_tip, drop_tip, seal).
     # batched_repair does not count it when the deleted step is one of INTENT_OPS.
-    r, stp = rows_for(10)
+    r, stp = rows_for(14)
     if r.numel() > 0:
         cand.op[r, stp] = OP_NOOP
 
-    # Edit 11: swap (err_t - 1, err_t)
-    r, stp = rows_for(11)
+    # Edit 15: swap (err_t - 1, err_t)
+    r, stp = rows_for(15)
     if r.numel() > 0:
         prev = (stp - 1).clamp(min=0)
         for fname in ("op", "src", "dst", "vol", "temp", "duration", "pipette", "rpm", "pad_mask"):
@@ -590,8 +610,8 @@ def _propose_k_edits(
             arr[r, prev] = v2
             arr[r, stp] = v1
 
-    # Edit 12: swap (err_t, err_t + 1)
-    r, stp = rows_for(12)
+    # Edit 16: swap (err_t, err_t + 1)
+    r, stp = rows_for(16)
     if r.numel() > 0:
         nxt = (stp + 1).clamp(max=t_len - 1)
         for fname in ("op", "src", "dst", "vol", "temp", "duration", "pipette", "rpm", "pad_mask"):
@@ -601,20 +621,43 @@ def _propose_k_edits(
             arr[r, stp] = v2
             arr[r, nxt] = v1
 
-    # Single-step insertions before err_t (computed on m-sized batch then placed into corresponding edit slice)
     b_idx_m = torch.arange(m, device=dev)
     t_m = first_err_step.clamp(0, broken_proto.max_steps - 1)
     src_at_err = broken_proto.src[b_idx_m, t_m].clamp(0, c - 1)
     dst_at_err = broken_proto.dst[b_idx_m, t_m].clamp(0, c - 1)
+    sealed_target = torch.where(state_at_err.sealed[b_idx_m, src_at_err], src_at_err, dst_at_err)
+    unsealed_target = torch.where(~state_at_err.sealed[b_idx_m, src_at_err], src_at_err, dst_at_err)
 
+    # Edit 17: delete earliest prior OP_SEAL on the sealed offending container (tried BEFORE inserting unseal!)
+    if k > 17:
+        r, _ = rows_for(17)
+        cols = torch.arange(broken_proto.max_steps, device=dev).unsqueeze(0)
+        prior_seal = (
+            (cols < t_m.unsqueeze(1))
+            & (~broken_proto.pad_mask)
+            & (broken_proto.op == OP_SEAL)
+            & (broken_proto.src == sealed_target.unsqueeze(1))
+        )
+        seal_pos = _first_matching_step(prior_seal)
+        has_prior = prior_seal.any(dim=1)
+        cand.op[r[has_prior], seal_pos[has_prior]] = OP_NOOP
+
+    # Edit 18: insert OP_THAW(src_at_err) at step 0 (restores pre-protocol stock thaw before pick_tip)
+    if k > 18:
+        r, _ = rows_for(18)
+        z_pos = torch.zeros((m,), dtype=torch.int64, device=dev)
+        op_vec = torch.full((m,), OP_THAW, dtype=torch.int64, device=dev)
+        inserted = _insert_step_before(broken_proto, z_pos, new_op=op_vec, new_src=src_at_err)
+        for fname in ("op", "src", "dst", "vol", "temp", "duration", "pipette", "rpm", "pad_mask"):
+            getattr(cand, fname)[r] = getattr(inserted, fname)
+
+    # Edits 19..23: single-step insertions immediately before err_t
     insert_specs: list[tuple[int, int, Tensor | None]] = [
-        (13, OP_PICK_TIP, None),
-        (14, OP_DROP_TIP, None),
-        (15, OP_THAW, src_at_err),
-        (16, OP_UNSEAL, src_at_err),
-        (17, OP_UNSEAL, dst_at_err),
-        (18, OP_SEAL, src_at_err),
-        (19, OP_SEAL, dst_at_err),
+        (19, OP_PICK_TIP, None),
+        (20, OP_DROP_TIP, None),
+        (21, OP_THAW, src_at_err),
+        (22, OP_UNSEAL, sealed_target),
+        (23, OP_SEAL, unsealed_target),
     ]
     for eid, ins_op, ins_src in insert_specs:
         if eid >= k:
@@ -625,50 +668,72 @@ def _propose_k_edits(
         for fname in ("op", "src", "dst", "vol", "temp", "duration", "pipette", "rpm", "pad_mask"):
             getattr(cand, fname)[r] = getattr(inserted, fname)
 
-    # Edit 20: insert OP_THAW(src_at_err) at step 0 (before pick_tip!)
-    if k > 20:
-        r, _ = rows_for(20)
-        z_pos = torch.zeros((m,), dtype=torch.int64, device=dev)
-        op_vec = torch.full((m,), OP_THAW, dtype=torch.int64, device=dev)
-        inserted = _insert_step_before(broken_proto, z_pos, new_op=op_vec, new_src=src_at_err)
-        for fname in ("op", "src", "dst", "vol", "temp", "duration", "pipette", "rpm", "pad_mask"):
-            getattr(cand, fname)[r] = getattr(inserted, fname)
-
-    # Edit 21: delete earliest prior OP_SEAL on dst_at_err (fixes premature seal!)
-    if k > 21:
-        r, _ = rows_for(21)
-        cols = torch.arange(broken_proto.max_steps, device=dev).unsqueeze(0)
-        prior_seal = (
-            (cols < t_m.unsqueeze(1))
-            & (~broken_proto.pad_mask)
-            & (broken_proto.op == OP_SEAL)
-            & (broken_proto.src == dst_at_err.unsqueeze(1))
-        )
-        seal_pos = _first_matching_step(prior_seal)
-        has_prior = prior_seal.any(dim=1)
-        cand.op[r[has_prior], seal_pos[has_prior]] = OP_NOOP
-
-    # Edits 22..k-1: redirect dst at err_t to alternate empty/reaction container
-    for eid in range(22, k):
+    # Edits 24..k-1: redirect dst at err_t to alternate empty/reaction container
+    for eid in range(24, k):
         r, stp = rows_for(eid)
         if r.numel() > 0:
-            alt_dst = (3 + (eid - 22)) % max(c, 1)
+            alt_dst = (3 + (eid - 24)) % max(c, 1)
             cand.dst[r, stp] = alt_dst
 
     return st_rep, cand
 
 
+def protocol_field_edit_distance(
+    steps_a: Sequence[dict[str, Any]],
+    steps_b: Sequence[dict[str, Any]],
+) -> int:
+    """Minimum changed step-field count aligning two serialized step sequences (8 fields per step)."""
+    n, m = len(steps_a), len(steps_b)
+    n_fields = len(_STEP_COMPARE_FIELDS)
+    if n == 0:
+        return m * n_fields
+    if m == 0:
+        return n * n_fields
+
+    # Fast exact path when lengths match and ops align 1-to-1
+    if n == m and all(a["op"] == b["op"] for a, b in zip(steps_a, steps_b, strict=True)):
+        return sum(
+            1
+            for a, b in zip(steps_a, steps_b, strict=True)
+            for f in _STEP_COMPARE_FIELDS
+            if a[f] != b[f]
+        )
+
+    prev = [j * n_fields for j in range(m + 1)]
+    for i in range(1, n + 1):
+        sa = steps_a[i - 1]
+        cur = [i * n_fields] + [0] * m
+        for j in range(1, m + 1):
+            sb = steps_b[j - 1]
+            sub_cost = sum(1 for f in _STEP_COMPARE_FIELDS if sa[f] != sb[f])
+            cur[j] = min(
+                prev[j] + n_fields,
+                cur[j - 1] + n_fields,
+                prev[j - 1] + sub_cost,
+            )
+        prev = cur
+    return prev[m]
+
+
 def batched_repair(
     init_state: LabStateBatch,
     broken_protocols: ProtocolBatch,
-    num_edits: int = 24,
+    num_edits: int = 26,
+    reference_protocols: ProtocolBatch | None = None,
 ) -> RepairResult:
     """Try K single-edit fixes per broken protocol in one batched checker pass.
 
     The lowest-numbered passing edit wins, but only among intent-preserving edits: deleting a
-    step in INTENT_OPS (edit 10) and redirecting a destination (edits 22+) never count as repairs.
+    step in INTENT_OPS (edit 14) and redirecting a destination (edits 24+) never count as repairs.
+    When `reference_protocols` is supplied, also computes `exact_recovery_rate` and
+    `mean_field_edit_distance` against the pre-corruption protocols.
     """
     dev = init_state.device
+    if reference_protocols is not None and reference_protocols.batch_size != broken_protocols.batch_size:
+        raise ValueError(
+            f"reference_protocols.batch_size={reference_protocols.batch_size} != "
+            f"broken_protocols.batch_size={broken_protocols.batch_size}"
+        )
     if dev.type == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -688,6 +753,10 @@ def batched_repair(
             chosen_edit=torch.zeros((0,), dtype=torch.int64, device=dev),
             edit_type_counts={},
             num_fixed_only_by_intent_change=0,
+            num_exact_recovered=0 if reference_protocols is not None else None,
+            exact_recovery_rate=0.0 if reference_protocols is not None else None,
+            mean_field_edit_distance=0.0 if reference_protocols is not None else None,
+            field_edit_distances=[] if reference_protocols is not None else None,
         )
     init_check = check_protocols_batched(init_state, broken_protocols)
     st_cand, pr_cand = _propose_k_edits(
@@ -703,14 +772,15 @@ def batched_repair(
 
     # Mask out intent-changing edits
     allowed = torch.ones((m, num_edits), dtype=torch.bool, device=dev)
-    if num_edits > 10:
+    if num_edits > 14:
         t_err = init_check.first_err_step.clamp(0, broken_protocols.max_steps - 1)
         op_err = broken_protocols.op[torch.arange(m, device=dev), t_err]
         deletes_intent = torch.zeros_like(op_err, dtype=torch.bool)
         for op_id in INTENT_OPS:
             deletes_intent |= op_err == op_id
-        allowed[:, 10] = ~deletes_intent
-    allowed[:, 22:] = False
+        allowed[:, 14] = ~deletes_intent
+    if num_edits > 24:
+        allowed[:, 24:] = False
 
     honest_ok = ok_grid & allowed
     repaired_mask = honest_ok.any(dim=1)
@@ -730,6 +800,32 @@ def batched_repair(
         edit_type_counts[kind] = edit_type_counts.get(kind, 0) + 1
 
     n_rep = int(repaired_mask.sum().item())
+    num_exact: int | None = None
+    exact_rate: float | None = None
+    mean_dist: float | None = None
+    dists: list[int] | None = None
+    if reference_protocols is not None:
+        rep_mask_list = repaired_mask.to("cpu").tolist()
+        best_cpu = best_protos.to("cpu")
+        ref_cpu = reference_protocols.to("cpu")
+        brok_cpu = broken_protocols.to("cpu")
+        dists = []
+        exact_cnt = 0
+        for row_i in range(m):
+            ref_steps = protocol_row_to_steps(ref_cpu, row_i)
+            cand_steps = (
+                protocol_row_to_steps(best_cpu, row_i)
+                if rep_mask_list[row_i]
+                else protocol_row_to_steps(brok_cpu, row_i)
+            )
+            d_val = protocol_field_edit_distance(cand_steps, ref_steps)
+            dists.append(d_val)
+            if rep_mask_list[row_i] and d_val == 0 and cand_steps == ref_steps:
+                exact_cnt += 1
+        num_exact = exact_cnt
+        exact_rate = exact_cnt / max(m, 1)
+        mean_dist = sum(dists) / max(m, 1)
+
     return RepairResult(
         num_broken=m,
         candidates_per_protocol=num_edits,
@@ -742,6 +838,10 @@ def batched_repair(
         chosen_edit=chosen_edit,
         edit_type_counts=edit_type_counts,
         num_fixed_only_by_intent_change=int(intent_only.sum().item()),
+        num_exact_recovered=num_exact,
+        exact_recovery_rate=exact_rate,
+        mean_field_edit_distance=mean_dist,
+        field_edit_distances=dists,
     )
 
 
@@ -753,15 +853,20 @@ _NAME_TO_OP: dict[str, int] = {name: code for code, name in OP_NAMES.items()}
 _NAME_TO_PIP: dict[str, int] = {name: code for code, name in PIPETTE_NAMES.items()}
 
 
-def protocol_row_to_steps(proto: ProtocolBatch, row: int = 0) -> list[dict[str, Any]]:
-    """Serialize one protocol row's active (unpadded, non-NOOP) steps into plain dicts."""
+def protocol_row_to_steps_with_map(
+    proto: ProtocolBatch,
+    row: int = 0,
+) -> tuple[list[dict[str, Any]], dict[int, int]]:
+    """Serialize one protocol row's active steps into dicts and map raw tensor slot -> compact step index."""
     steps: list[dict[str, Any]] = []
+    raw_to_compact: dict[int, int] = {}
     for t in range(proto.max_steps):
         if bool(proto.pad_mask[row, t].item()):
             continue
         op_code = int(proto.op[row, t].item())
         if op_code == OP_NOOP:
             continue
+        raw_to_compact[t] = len(steps)
         steps.append(
             {
                 "op": OP_NAMES.get(op_code, str(op_code)),
@@ -774,7 +879,25 @@ def protocol_row_to_steps(proto: ProtocolBatch, row: int = 0) -> list[dict[str, 
                 "rpm": int(proto.rpm[row, t].item()),
             }
         )
+    return steps, raw_to_compact
+
+
+def protocol_row_to_steps(proto: ProtocolBatch, row: int = 0) -> list[dict[str, Any]]:
+    """Serialize one protocol row's active (unpadded, non-NOOP) steps into plain dicts."""
+    steps, _ = protocol_row_to_steps_with_map(proto, row=row)
     return steps
+
+
+def map_raw_step_to_compact(proto: ProtocolBatch, row: int, raw_step: int) -> int | None:
+    """Map a checker's raw tensor `first_err_step` onto the compacted `protocol_row_to_steps` index."""
+    if raw_step < 0:
+        return None
+    steps, raw_to_compact = protocol_row_to_steps_with_map(proto, row=row)
+    if raw_step in raw_to_compact:
+        return raw_to_compact[raw_step]
+    if raw_step == 0 and steps:
+        return 0
+    return None
 
 
 def steps_dicts_to_protocol_batch(
@@ -844,12 +967,16 @@ def state_batch_from_dicts(
     )
 
 
-def _to_twinstep_step_dicts(steps: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Project labfill steps onto twinstep's generic liquid-handling step schema where applicable."""
+def _to_twinstep_step_dicts_with_map(
+    steps: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[int, int]]:
+    """Project labfill steps onto twinstep's generic liquid-handling schema and map compact -> twinstep index."""
     projected: list[dict[str, Any]] = []
-    for st in steps:
+    compact_to_twinstep: dict[int, int] = {}
+    for idx, st in enumerate(steps):
         op_name = st["op"]
         if op_name == "transfer" and st["vol"] > 0:
+            compact_to_twinstep[idx] = len(projected)
             projected.append(
                 {
                     "type": "transfer",
@@ -860,6 +987,7 @@ def _to_twinstep_step_dicts(steps: Sequence[dict[str, Any]]) -> list[dict[str, A
                 }
             )
         elif op_name == "mix" and st["vol"] > 0:
+            compact_to_twinstep[idx] = len(projected)
             projected.append(
                 {
                     "type": "mix",
@@ -870,6 +998,7 @@ def _to_twinstep_step_dicts(steps: Sequence[dict[str, Any]]) -> list[dict[str, A
                 }
             )
         elif op_name == "incubate" and st["duration"] > 0:
+            compact_to_twinstep[idx] = len(projected)
             projected.append(
                 {
                     "type": "incubate",
@@ -879,6 +1008,12 @@ def _to_twinstep_step_dicts(steps: Sequence[dict[str, Any]]) -> list[dict[str, A
                     "time_unit": "s",
                 }
             )
+    return projected, compact_to_twinstep
+
+
+def _to_twinstep_step_dicts(steps: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project labfill steps onto twinstep's generic liquid-handling step schema where applicable."""
+    projected, _ = _to_twinstep_step_dicts_with_map(steps)
     return projected
 
 
@@ -896,11 +1031,20 @@ def to_twinstep_records(
     out: list[dict[str, Any]] = []
 
     for i in range(b):
-        bad_steps = protocol_row_to_steps(broken, i)
+        bad_steps, raw_to_compact = protocol_row_to_steps_with_map(broken, i)
+        ts_steps, compact_to_ts = _to_twinstep_step_dicts_with_map(bad_steps)
         good_steps = protocol_row_to_steps(repaired, i) if repaired is not None else []
         is_ok = bool(chk_bad.ok[i].item())
         err_c = int(chk_bad.err_code[i].item())
         err_s = int(chk_bad.first_err_step[i].item())
+        if is_ok:
+            compact_step: int | None = None
+            raw_step: int | None = None
+            ts_step: int | None = None
+        else:
+            raw_step = err_s
+            compact_step = raw_to_compact.get(err_s, 0 if (err_s == 0 and bad_steps) else None)
+            ts_step = compact_to_ts.get(compact_step) if compact_step is not None else None
         label = "clean" if is_ok else error_type
         rep_ok = bool(chk_rep.ok[i].item()) if chk_rep is not None else False
         out.append(
@@ -910,18 +1054,20 @@ def to_twinstep_records(
                 "protocol_id": f"{protocol_id_prefix}_{i:04d}",
                 "correct_steps": good_steps,
                 "corrupted_steps": bad_steps,
-                "twinstep_steps": _to_twinstep_step_dicts(bad_steps),
+                "twinstep_steps": ts_steps,
                 "label": label,
                 "error_type": label,
                 "err_code": err_c,
                 "err_name": ERR_NAMES.get(err_c, "unknown"),
-                "step_index": None if is_ok else err_s,
+                "step_index": compact_step,
+                "raw_step_index": raw_step,
+                "twinstep_step_index": ts_step,
                 "repaired_verified": rep_ok,
                 "init_state": state_row_to_dict(init_state, i),
                 "description": (
                     "clean protocol"
                     if is_ok
-                    else f"{error_type} ({ERR_NAMES.get(err_c, 'unknown')} at raw step {err_s})"
+                    else f"{error_type} ({ERR_NAMES.get(err_c, 'unknown')} at step {compact_step}, raw slot {err_s})"
                 ),
             }
         )
@@ -939,7 +1085,8 @@ def to_preference_jsonl(
     """Serialize `(init_state, broken, repaired)` pairs as DPO/RLVR preference JSONL for post-training.
 
     When `only_verified=True`, emits only rows where `broken` is rejected and `repaired` passes
-    `check_protocols_batched`.
+    `check_protocols_batched`. `first_err_step` stores the compact index into `rejected_steps`,
+    while `raw_first_err_step` preserves the raw `ProtocolBatch` slot index.
     """
     if broken.batch_size != repaired.batch_size or init_state.batch_size != broken.batch_size:
         raise ValueError("init_state, broken, and repaired must have matching batch_size")
@@ -954,10 +1101,16 @@ def to_preference_jsonl(
         if only_verified and (bad_ok or not good_ok):
             continue
 
-        bad_steps = protocol_row_to_steps(broken, i)
+        bad_steps, raw_to_compact = protocol_row_to_steps_with_map(broken, i)
         good_steps = protocol_row_to_steps(repaired, i)
         err_c = int(chk_bad.err_code[i].item())
         err_s = int(chk_bad.first_err_step[i].item())
+        if bad_ok:
+            compact_err_s = -1
+            raw_err_s = -1
+        else:
+            raw_err_s = err_s
+            compact_err_s = raw_to_compact.get(err_s, 0 if (err_s == 0 and bad_steps) else -1)
         st_dict = state_row_to_dict(init_state, i)
 
         record = {
@@ -966,7 +1119,8 @@ def to_preference_jsonl(
             "error_type": error_type,
             "err_code": err_c,
             "err_name": ERR_NAMES.get(err_c, "unknown"),
-            "first_err_step": err_s,
+            "first_err_step": compact_err_s,
+            "raw_first_err_step": raw_err_s,
             "chosen_reward": 1.0 if good_ok else 0.0,
             "rejected_reward": 1.0 if bad_ok else 0.0,
             "prompt": (

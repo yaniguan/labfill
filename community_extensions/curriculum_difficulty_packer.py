@@ -210,40 +210,27 @@ def pack_curriculum_bins_bfd(
         reverse=True,
     )
 
-    bin_slices: list[list[PackedSequenceSlice]] = []
-    bin_used: list[int] = []
+    from labfill.fill_gpu import pack_lengths_obfd
 
-    for g in ordered:
-        best_idx = -1
-        best_rem = bin_cap + 1
-        for b_idx, used in enumerate(bin_used):
-            rem = bin_cap - used
-            if g.token_len <= rem and (rem - g.token_len) < best_rem:
-                best_rem = rem - g.token_len
-                best_idx = b_idx
-
-        if best_idx == -1:
-            sl = PackedSequenceSlice(
-                seq_id=g.group_id,
-                offset=0,
-                length=g.token_len,
-                curriculum_weight=g.curriculum_weight,
-            )
-            bin_slices.append([sl])
-            bin_used.append(g.token_len)
-        else:
-            offset = bin_used[best_idx]
-            sl = PackedSequenceSlice(
-                seq_id=g.group_id,
-                offset=offset,
-                length=g.token_len,
-                curriculum_weight=g.curriculum_weight,
-            )
-            bin_slices[best_idx].append(sl)
-            bin_used[best_idx] += g.token_len
-
+    obfd_bins = pack_lengths_obfd(
+        [g.token_len for g in ordered],
+        bin_cap=bin_cap,
+        ordered_indices=range(len(ordered)),
+    )
     packed_bins = [
-        PackedCurriculumBin(bin_cap=bin_cap, slices=tuple(sls)) for sls in bin_slices
+        PackedCurriculumBin(
+            bin_cap=bin_cap,
+            slices=tuple(
+                PackedSequenceSlice(
+                    seq_id=ordered[orig_i].group_id,
+                    offset=off,
+                    length=ln,
+                    curriculum_weight=ordered[orig_i].curriculum_weight,
+                )
+                for orig_i, off, ln in b_slices
+            ),
+        )
+        for b_slices in obfd_bins
     ]
     if overflow_policy == "quarantine":
         return packed_bins, dropped, tuple(quarantined_ids)

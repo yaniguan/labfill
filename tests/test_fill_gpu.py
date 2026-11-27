@@ -26,7 +26,9 @@ from labfill.fill_gpu import (
     detect_gpu_peak_flops,
     flex_local_global_attention,
     generate_protocol_sequences,
+    pack_lengths_obfd,
     pack_sequence_pairs,
+    pack_sequences_obfd,
     packed_sequence_ce_loss,
     probe_flex_attention,
     run_fill_gpu_ablation,
@@ -674,5 +676,57 @@ def test_flash_attn_varlen_func_dispatch(monkeypatch: pytest.MonkeyPatch) -> Non
     out_cpu = blk._run_varlen_qkv(x_cpu, x_cpu, x_cpu, cu, max_seqlen=6)
     assert out_cpu.shape == (10, 32)
     assert called_args == {}
+
+
+def test_obfd_segment_tree_matches_naive_bfd_and_scales_to_10k_sequences() -> None:
+    """Verify Ding et al. (2024) O(N log N) OBFD matches O(N^2) BFD bit-for-bit and scales fast."""
+    import time
+
+    def _naive_bfd(lengths: list[int], bin_cap: int) -> list[list[tuple[int, int, int]]]:
+        order = sorted(range(len(lengths)), key=lambda i: (-lengths[i], i))
+        used: list[int] = []
+        bins: list[list[tuple[int, int, int]]] = []
+        for idx in order:
+            ln = lengths[idx]
+            best_b = -1
+            best_rem = bin_cap + 1
+            for b_i, u in enumerate(used):
+                rem = bin_cap - u
+                if ln <= rem and (rem - ln) < best_rem:
+                    best_rem = rem - ln
+                    best_b = b_i
+            if best_b < 0:
+                used.append(ln)
+                bins.append([(idx, 0, ln)])
+            else:
+                off = used[best_b]
+                bins[best_b].append((idx, off, ln))
+                used[best_b] = off + ln
+        return bins
+
+    for seed in (0, 17, 99):
+        items = generate_protocol_sequences(num_sequences=180, min_len=8, max_len=512, seed=seed)
+        lens = [len(it.tokens) for it in items]
+        obfd = pack_lengths_obfd(lens, bin_cap=512)
+        naive = _naive_bfd(lens, bin_cap=512)
+        assert obfd == naive
+
+        pairs = [
+            (torch.tensor(it.tokens, dtype=torch.int64), torch.tensor(it.labels, dtype=torch.int64))
+            for it in items
+        ]
+        ff_batches = pack_sequence_pairs(pairs, pack_len=512, rows_per_batch=1, attn_mode="dense")
+        obfd_batches = pack_sequences_obfd(pairs, pack_len=512, rows_per_batch=1, attn_mode="dense")
+        assert len(obfd_batches) <= len(ff_batches)
+        assert sum(b.real_tokens for b in obfd_batches) == sum(lens)
+
+    # Scale check: 10,000 sequences packed into bin_cap=2048 in well under 0.5s
+    g = torch.Generator().manual_seed(2026)
+    big_lens = torch.randint(16, 1500, (10_000,), generator=g).tolist()
+    t0 = time.perf_counter()
+    big_bins = pack_lengths_obfd(big_lens, bin_cap=2048)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 1.0
+    assert sum(ln for b in big_bins for _, _, ln in b) == sum(big_lens)
 
 

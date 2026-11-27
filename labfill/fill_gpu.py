@@ -15,11 +15,12 @@ Addresses common causes of low single-GPU throughput on science/protocol tasks:
 from __future__ import annotations
 
 import hashlib
+import heapq
 import statistics
 import time
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 import torch
@@ -336,22 +337,15 @@ def collate_padded_pairs(
     )
 
 
-def pack_sequence_pairs(
+def _normalize_pack_inputs(
     pairs: list[tuple[Tensor, Tensor]],
-    pack_len: int = 512,
-    rows_per_batch: int = 4,
-    attn_mode: str = "dense",
-    truncate: bool = False,
-    overflow_policy: str = "raise",
-    curriculum_weights: list[float] | tuple[float, ...] | None = None,
-) -> list[PreparedBatch]:
-    """First-fit / greedy bin-pack sequences into fixed-capacity bins of `pack_len`.
-
-    Resets `position_ids` to `0..len-1` per packed sequence. When `attn_mode == 'packed_varlen'`,
-    emits unpadded 1D `(T_real,)` tensors with cumulative `cu_seqlens` and `max_seqlen <= pack_len`
-    for zero-padding varlen FlashAttention / jagged SDPA without allocating dense `(B, 1, S, S)` masks.
-    Raises ValueError if any sequence is empty (`<= 0`) or exceeds `pack_len` under `overflow_policy='raise'`.
-    """
+    pack_len: int,
+    rows_per_batch: int,
+    attn_mode: str,
+    truncate: bool,
+    overflow_policy: str,
+    curriculum_weights: list[float] | tuple[float, ...] | None,
+) -> list[tuple[Tensor, Tensor, float | None]]:
     if pack_len < 1:
         raise ValueError(f"pack_len must be >= 1, got {pack_len}")
     if rows_per_batch < 1:
@@ -396,25 +390,16 @@ def pack_sequence_pairs(
                 continue
         else:
             normalized_items.append((tok, lbl, cw))
+    return normalized_items
 
-    # First-fit bin assignment tracking slices per bin without allocating O(S^2) masks
-    bins_used: list[int] = []
-    bins_entries: list[list[tuple[Tensor, Tensor, float | None]]] = []
 
-    for tok, lbl, cw in normalized_items:
-        n = int(tok.numel())
-        placed = -1
-        for b_idx, used in enumerate(bins_used):
-            if used + n <= pack_len:
-                placed = b_idx
-                break
-        if placed < 0:
-            placed = len(bins_used)
-            bins_used.append(0)
-            bins_entries.append([])
-        bins_entries[placed].append((tok, lbl, cw))
-        bins_used[placed] += n
-
+def _materialize_packed_bins(
+    bins_entries: list[list[tuple[Tensor, Tensor, float | None]]],
+    pack_len: int,
+    rows_per_batch: int,
+    attn_mode: str,
+    has_curriculum_weights: bool,
+) -> list[PreparedBatch]:
     batches: list[PreparedBatch] = []
     is_varlen_pack = attn_mode in ("packed_varlen", "varlen")
 
@@ -430,7 +415,7 @@ def pack_sequence_pairs(
             pos_1d = torch.cat([torch.arange(ln, dtype=torch.int64) for ln in flat_lens], dim=0)
             cu_seq, max_s = build_cu_seqlens(flat_lens)
             tw_1d: Tensor | None = None
-            if curriculum_weights is not None:
+            if has_curriculum_weights:
                 tw_1d = torch.cat(
                     [
                         torch.full((int(t.numel()),), float(cw or 0.0), dtype=torch.bfloat16)
@@ -461,7 +446,7 @@ def pack_sequence_pairs(
             chunk_sid = torch.zeros((num_rows, pack_len), dtype=torch.int64)
             chunk_tw = (
                 torch.zeros((num_rows, pack_len), dtype=torch.bfloat16)
-                if curriculum_weights is not None
+                if has_curriculum_weights
                 else None
             )
             for r_idx, b_list in enumerate(bin_group):
@@ -491,6 +476,195 @@ def pack_sequence_pairs(
                 )
             )
     return batches
+
+
+def pack_lengths_obfd(
+    lengths: Sequence[int],
+    bin_cap: int = 512,
+    *,
+    ordered_indices: Sequence[int] | None = None,
+) -> list[list[tuple[int, int, int]]]:
+    """Ding et al. (2024) `O(N log N)` Segment-Tree Best-Fit-Decreasing (`OBFD`) bin assignment.
+
+    Maintains an iterative power-of-2 max-capacity segment tree over remaining capacities `1..bin_cap`
+    with per-capacity min-heaps on bin creation index, returning exact BFD bin placements
+    `[[(orig_idx, offset, length), ...], ...]` in `O(N log L + N log B)` time (zero `O(N^2)` bin scan).
+    """
+    if bin_cap < 1:
+        raise ValueError(f"bin_cap must be >= 1, got {bin_cap}")
+    if not lengths:
+        return []
+
+    int_lens: list[int] = []
+    for i, raw_l in enumerate(lengths):
+        ln = int(raw_l)
+        if ln <= 0 or ln > bin_cap:
+            raise ValueError(f"Sequence {i} length {ln} outside [1, {bin_cap}]")
+        int_lens.append(ln)
+
+    if ordered_indices is not None:
+        order = [int(idx) for idx in ordered_indices]
+    else:
+        # O(N + bin_cap) stable counting sort in decreasing length order
+        by_len: list[list[int]] = [[] for _ in range(bin_cap + 1)]
+        for idx, ln in enumerate(int_lens):
+            by_len[ln].append(idx)
+        order = [idx for ln in range(bin_cap, 0, -1) for idx in by_len[ln]]
+
+    size = 1
+    while size <= bin_cap:
+        size <<= 1
+    tree = [0] * (2 * size)
+    bins_by_rem: list[list[int]] = [[] for _ in range(bin_cap + 1)]
+    bins_used: list[int] = []
+    bins_slices: list[list[tuple[int, int, int]]] = []
+
+    def _set_leaf(cap: int, active: bool) -> None:
+        pos = size + cap
+        tree[pos] = cap if active else 0
+        pos >>= 1
+        while pos >= 1:
+            left_v = tree[pos << 1]
+            right_v = tree[(pos << 1) | 1]
+            new_v = left_v if left_v >= right_v else right_v
+            if tree[pos] == new_v:
+                break
+            tree[pos] = new_v
+            pos >>= 1
+
+    for orig_idx in order:
+        ln = int_lens[orig_idx]
+        if tree[1] < ln:
+            b_idx = len(bins_used)
+            bins_used.append(ln)
+            bins_slices.append([(orig_idx, 0, ln)])
+            rem_after = bin_cap - ln
+            if rem_after > 0:
+                heap = bins_by_rem[rem_after]
+                was_empty = not heap
+                heapq.heappush(heap, b_idx)
+                if was_empty:
+                    _set_leaf(rem_after, True)
+        else:
+            # Walk down segment tree in exact log2(size) steps to minimum active capacity >= ln
+            node = 1
+            while node < size:
+                left = node << 1
+                if tree[left] >= ln:
+                    node = left
+                else:
+                    node = left | 1
+            best_rem = node - size
+            heap = bins_by_rem[best_rem]
+            b_idx = heapq.heappop(heap)
+            if not heap:
+                _set_leaf(best_rem, False)
+
+            offset = bins_used[b_idx]
+            bins_slices[b_idx].append((orig_idx, offset, ln))
+            bins_used[b_idx] = offset + ln
+            rem_after = best_rem - ln
+            if rem_after > 0:
+                heap_after = bins_by_rem[rem_after]
+                was_empty = not heap_after
+                heapq.heappush(heap_after, b_idx)
+                if was_empty:
+                    _set_leaf(rem_after, True)
+
+    return bins_slices
+
+
+def pack_sequence_pairs(
+    pairs: list[tuple[Tensor, Tensor]],
+    pack_len: int = 512,
+    rows_per_batch: int = 4,
+    attn_mode: str = "dense",
+    truncate: bool = False,
+    overflow_policy: str = "raise",
+    curriculum_weights: list[float] | tuple[float, ...] | None = None,
+) -> list[PreparedBatch]:
+    """First-fit / greedy bin-pack sequences into fixed-capacity bins of `pack_len`.
+
+    Resets `position_ids` to `0..len-1` per packed sequence. When `attn_mode == 'packed_varlen'`,
+    emits unpadded 1D `(T_real,)` tensors with cumulative `cu_seqlens` and `max_seqlen <= pack_len`
+    for zero-padding varlen FlashAttention / jagged SDPA without allocating dense `(B, 1, S, S)` masks.
+    Raises ValueError if any sequence is empty (`<= 0`) or exceeds `pack_len` under `overflow_policy='raise'`.
+    """
+    normalized_items = _normalize_pack_inputs(
+        pairs=pairs,
+        pack_len=pack_len,
+        rows_per_batch=rows_per_batch,
+        attn_mode=attn_mode,
+        truncate=truncate,
+        overflow_policy=overflow_policy,
+        curriculum_weights=curriculum_weights,
+    )
+
+    bins_used: list[int] = []
+    bins_entries: list[list[tuple[Tensor, Tensor, float | None]]] = []
+
+    for tok, lbl, cw in normalized_items:
+        n = int(tok.numel())
+        placed = -1
+        for b_idx, used in enumerate(bins_used):
+            if used + n <= pack_len:
+                placed = b_idx
+                break
+        if placed < 0:
+            placed = len(bins_used)
+            bins_used.append(0)
+            bins_entries.append([])
+        bins_entries[placed].append((tok, lbl, cw))
+        bins_used[placed] += n
+
+    return _materialize_packed_bins(
+        bins_entries=bins_entries,
+        pack_len=pack_len,
+        rows_per_batch=rows_per_batch,
+        attn_mode=attn_mode,
+        has_curriculum_weights=(curriculum_weights is not None),
+    )
+
+
+def pack_sequences_obfd(
+    pairs: list[tuple[Tensor, Tensor]],
+    pack_len: int = 512,
+    rows_per_batch: int = 4,
+    attn_mode: str = "dense",
+    truncate: bool = False,
+    overflow_policy: str = "raise",
+    curriculum_weights: list[float] | tuple[float, ...] | None = None,
+) -> list[PreparedBatch]:
+    """Pack sequences using Ding et al. (2024) `O(N log N)` Segment-Tree Best-Fit-Decreasing (`OBFD`).
+
+    Minimizes wasted bin capacity and total packed bins without truncations (when `pack_len >= max_len`
+    or `overflow_policy='chunk'`) while resetting `position_ids` and isolating `seq_id` / `cu_seqlens`.
+    """
+    normalized_items = _normalize_pack_inputs(
+        pairs=pairs,
+        pack_len=pack_len,
+        rows_per_batch=rows_per_batch,
+        attn_mode=attn_mode,
+        truncate=truncate,
+        overflow_policy=overflow_policy,
+        curriculum_weights=curriculum_weights,
+    )
+    if not normalized_items:
+        return []
+
+    item_lens = [int(tok.numel()) for tok, _, _ in normalized_items]
+    bin_assignments = pack_lengths_obfd(item_lens, bin_cap=pack_len)
+    bins_entries: list[list[tuple[Tensor, Tensor, float | None]]] = [
+        [normalized_items[orig_idx] for orig_idx, _off, _ln in b_slices]
+        for b_slices in bin_assignments
+    ]
+    return _materialize_packed_bins(
+        bins_entries=bins_entries,
+        pack_len=pack_len,
+        rows_per_batch=rows_per_batch,
+        attn_mode=attn_mode,
+        has_curriculum_weights=(curriculum_weights is not None),
+    )
 
 
 def collate_pack_for_dataloader(
@@ -583,8 +757,18 @@ def build_batches_from_items(
             pairs, pack_len=pack_len, rows_per_batch=pack_rows_per_batch, attn_mode="dense"
         )
 
+    if strategy == "packed_obfd":
+        return pack_sequences_obfd(
+            pairs, pack_len=pack_len, rows_per_batch=pack_rows_per_batch, attn_mode="dense"
+        )
+
     if strategy == "packed_varlen":
         return pack_sequence_pairs(
+            pairs, pack_len=pack_len, rows_per_batch=pack_rows_per_batch, attn_mode="packed_varlen"
+        )
+
+    if strategy == "packed_obfd_varlen":
+        return pack_sequences_obfd(
             pairs, pack_len=pack_len, rows_per_batch=pack_rows_per_batch, attn_mode="packed_varlen"
         )
 
@@ -1861,6 +2045,7 @@ def run_fill_gpu_ablation(
     seed: int = 0,
     device: str | torch.device | None = None,
     include_varlen_bf16: bool | None = None,
+    include_obfd: bool = False,
     loss_reduction: str = "sequence_mean",
     mfu_na_label: str = "N/A",
 ) -> tuple[list[AblationRow], list[dict[str, Any]], dict[str, Any]]:
@@ -1989,6 +2174,27 @@ def run_fill_gpu_ablation(
             loss_reduction=loss_reduction,
         )
     )
+
+    if include_obfd:
+        obfd_batches = build_batches_from_items(
+            items, "packed_obfd", pack_len=pack_len, pack_rows_per_batch=pack_rows_per_batch
+        )
+        m_obfd = fresh_model()
+        rows.append(
+            _execute_timed_batches(
+                "e1_obfd_packed_bf16",
+                m_obfd,
+                m_obfd,
+                lambda: obfd_batches,
+                dev,
+                use_bf16=True,
+                warmup_steps=base_warmup,
+                peak_flops=peak_flops,
+                mfu_na_label=mfu_na_label,
+                loss_reduction=loss_reduction,
+                notes="Ding et al. (2024) O(N log N) Segment-Tree OBFD + BF16",
+            )
+        )
 
     # (f) torch.compile on packed + BF16 (record honestly if C++ compiler missing or slow)
     m_f_base = fresh_model()

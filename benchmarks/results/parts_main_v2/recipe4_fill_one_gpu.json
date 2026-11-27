@@ -1,0 +1,401 @@
+{
+  "machine": {
+    "date": "2026-11-26",
+    "device_type": "cpu",
+    "cpu_model": "AMD64 Family 26 Model 96 Stepping 0, AuthenticAMD",
+    "cpu_cores": 16,
+    "torch_num_threads": 1,
+    "cpu_isa_highlights": [],
+    "python_version": "3.11.15",
+    "torch_version": "2.14.0+cpu",
+    "cuda_version": null,
+    "flash_attn_available": false,
+    "numpy_version": "2.4.6",
+    "load_avg_1_5_15_at_start": null,
+    "cuda_available": false,
+    "gpu_name": "none (CPU only)",
+    "gpu_compute_capability": null,
+    "gpu_vram_mb": null,
+    "nvidia_smi_telemetry": null
+  },
+  "wall_sec": 441.83,
+  "result": {
+    "num_seeds": 5,
+    "ablation": [
+      {
+        "config": "a_padded_baseline",
+        "status": "ok",
+        "num_seeds": 5,
+        "real_tokens_per_sec": 438.5,
+        "real_tokens_per_sec_range": [
+          321.9,
+          609.8
+        ],
+        "useful_token_fraction": 0.2498,
+        "step_time_ms": 1948.5,
+        "data_wait_ms": 0.04,
+        "compute_ms": 2138.9,
+        "data_wait_fraction": 0.0,
+        "useful_tflops_per_sec": 0.0089,
+        "executed_tflops_per_sec": 0.0353,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 1.0,
+        "speedup_min": 1.0,
+        "speedup_max": 1.0,
+        "speedup_range": [
+          1.0,
+          1.0
+        ],
+        "final_loss": 0.6281,
+        "gpu_tokens_per_sec": "not yet measured",
+        "gpu_tokens_per_sec_range": "not yet measured",
+        "notes": ""
+      },
+      {
+        "config": "b_length_bucketed",
+        "status": "ok",
+        "num_seeds": 5,
+        "real_tokens_per_sec": 1031.7,
+        "real_tokens_per_sec_range": [
+          674.1,
+          1399.4
+        ],
+        "useful_token_fraction": 0.5832,
+        "step_time_ms": 411.4,
+        "data_wait_ms": 0.04,
+        "compute_ms": 908.9,
+        "data_wait_fraction": 0.0001,
+        "useful_tflops_per_sec": 0.021,
+        "executed_tflops_per_sec": 0.0387,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 2.09,
+        "speedup_min": 1.76,
+        "speedup_max": 2.85,
+        "speedup_range": [
+          1.76,
+          2.85
+        ],
+        "final_loss": 0.1553,
+        "gpu_tokens_per_sec": "not yet measured",
+        "gpu_tokens_per_sec_range": "not yet measured",
+        "notes": ""
+      },
+      {
+        "config": "c_sequence_packed",
+        "status": "ok",
+        "num_seeds": 5,
+        "real_tokens_per_sec": 1337.5,
+        "real_tokens_per_sec_range": [
+          1129.3,
+          1445.3
+        ],
+        "useful_token_fraction": 0.9238,
+        "step_time_ms": 697.2,
+        "data_wait_ms": 0.04,
+        "compute_ms": 701.2,
+        "data_wait_fraction": 0.0001,
+        "useful_tflops_per_sec": 0.0272,
+        "executed_tflops_per_sec": 0.0368,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 3.05,
+        "speedup_min": 2.37,
+        "speedup_max": 3.51,
+        "speedup_range": [
+          2.37,
+          3.51
+        ],
+        "final_loss": 0.4307,
+        "gpu_tokens_per_sec": "not yet measured",
+        "gpu_tokens_per_sec_range": "not yet measured",
+        "notes": ""
+      },
+      {
+        "config": "d_varlen_nested_sdpa",
+        "status": "ok",
+        "num_seeds": 5,
+        "real_tokens_per_sec": 768.3,
+        "real_tokens_per_sec_range": [
+          551.1,
+          973.0
+        ],
+        "useful_token_fraction": 1.0,
+        "step_time_ms": 1033.4,
+        "data_wait_ms": 0.04,
+        "compute_ms": 1220.6,
+        "data_wait_fraction": 0.0,
+        "useful_tflops_per_sec": 0.0156,
+        "executed_tflops_per_sec": 0.0156,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 1.71,
+        "speedup_min": 1.54,
+        "speedup_max": 1.98,
+        "speedup_range": [
+          1.54,
+          1.98
+        ],
+        "final_loss": 0.6281,
+        "gpu_tokens_per_sec": "not yet measured",
+        "gpu_tokens_per_sec_range": "not yet measured",
+        "notes": "PyTorch jagged nested_tensor + SDPA (is_causal=False)"
+      },
+      {
+        "config": "e_packed_bf16_autocast",
+        "status": "ok",
+        "num_seeds": 5,
+        "real_tokens_per_sec": 1631.6,
+        "real_tokens_per_sec_range": [
+          1084.0,
+          1783.5
+        ],
+        "useful_token_fraction": 0.9238,
+        "step_time_ms": 581.7,
+        "data_wait_ms": 0.04,
+        "compute_ms": 561.3,
+        "data_wait_fraction": 0.0001,
+        "useful_tflops_per_sec": 0.0336,
+        "executed_tflops_per_sec": 0.0421,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 3.36,
+        "speedup_min": 2.49,
+        "speedup_max": 4.19,
+        "speedup_range": [
+          2.49,
+          4.19
+        ],
+        "final_loss": 0.4306,
+        "gpu_tokens_per_sec": "not yet measured",
+        "gpu_tokens_per_sec_range": "not yet measured",
+        "notes": ""
+      },
+      {
+        "config": "e1_obfd_packed_bf16",
+        "status": "ok",
+        "num_seeds": 5,
+        "real_tokens_per_sec": 1450.8,
+        "real_tokens_per_sec_range": [
+          1077.8,
+          1624.4
+        ],
+        "useful_token_fraction": 0.9238,
+        "step_time_ms": 674.9,
+        "data_wait_ms": 0.04,
+        "compute_ms": 631.2,
+        "data_wait_fraction": 0.0001,
+        "useful_tflops_per_sec": 0.0299,
+        "executed_tflops_per_sec": 0.0374,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 3.3,
+        "speedup_min": 2.5,
+        "speedup_max": 3.72,
+        "speedup_range": [
+          2.5,
+          3.72
+        ],
+        "final_loss": 1.3416,
+        "gpu_tokens_per_sec": "not yet measured",
+        "gpu_tokens_per_sec_range": "not yet measured",
+        "notes": "Ding et al. (2024) O(N log N) Segment-Tree OBFD + BF16"
+      },
+      {
+        "config": "f_packed_torch_compile",
+        "status": "failed (InductorError)",
+        "real_tokens_per_sec": 0.0,
+        "useful_token_fraction": 0.0,
+        "step_time_ms": 0.0,
+        "data_wait_ms": 0.0,
+        "compute_ms": 0.0,
+        "data_wait_fraction": 0.0,
+        "useful_tflops_per_sec": 0.0,
+        "executed_tflops_per_sec": 0.0,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 0.0,
+        "final_loss": NaN,
+        "notes": "InvalidCxxCompiler: Compiler: cl is not found.",
+        "real_tokens": 0,
+        "total_tokens": 0,
+        "num_seeds": 5,
+        "gpu_tokens_per_sec": "not yet measured"
+      },
+      {
+        "config": "g1_sync_slow_tokenizer",
+        "status": "ok",
+        "num_seeds": 5,
+        "real_tokens_per_sec": 790.0,
+        "real_tokens_per_sec_range": [
+          719.6,
+          1143.7
+        ],
+        "useful_token_fraction": 0.78,
+        "step_time_ms": 1096.6,
+        "data_wait_ms": 255.72,
+        "compute_ms": 903.5,
+        "data_wait_fraction": 0.2175,
+        "useful_tflops_per_sec": 0.0163,
+        "executed_tflops_per_sec": 0.0259,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 2.03,
+        "speedup_min": 1.64,
+        "speedup_max": 2.4,
+        "speedup_range": [
+          1.64,
+          2.4
+        ],
+        "final_loss": 0.6279,
+        "gpu_tokens_per_sec": "not yet measured",
+        "gpu_tokens_per_sec_range": "not yet measured",
+        "notes": "num_workers=0 with CPU tokenizer work"
+      },
+      {
+        "config": "g2_async_dataloader",
+        "status": "ok",
+        "num_seeds": 5,
+        "real_tokens_per_sec": 1217.2,
+        "real_tokens_per_sec_range": [
+          842.8,
+          1336.9
+        ],
+        "useful_token_fraction": 0.78,
+        "step_time_ms": 718.9,
+        "data_wait_ms": 39.68,
+        "compute_ms": 726.8,
+        "data_wait_fraction": 0.0518,
+        "useful_tflops_per_sec": 0.0243,
+        "executed_tflops_per_sec": 0.0398,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 2.72,
+        "speedup_min": 2.0,
+        "speedup_max": 3.46,
+        "speedup_range": [
+          2.0,
+          3.46
+        ],
+        "final_loss": 0.6279,
+        "gpu_tokens_per_sec": "not yet measured",
+        "gpu_tokens_per_sec_range": "not yet measured",
+        "notes": "num_workers=2 (spawn), prefetch_factor=2, pin_memory=(cuda)"
+      },
+      {
+        "config": "h_block_sparse_bf16",
+        "status": "ok",
+        "num_seeds": 5,
+        "real_tokens_per_sec": 2019.3,
+        "real_tokens_per_sec_range": [
+          1631.0,
+          2082.9
+        ],
+        "useful_token_fraction": 0.9238,
+        "step_time_ms": 466.6,
+        "data_wait_ms": 0.04,
+        "compute_ms": 464.4,
+        "data_wait_fraction": 0.0001,
+        "useful_tflops_per_sec": 0.0411,
+        "executed_tflops_per_sec": 0.045,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 4.24,
+        "speedup_min": 3.32,
+        "speedup_max": 6.27,
+        "speedup_range": [
+          3.32,
+          6.27
+        ],
+        "final_loss": 0.4269,
+        "gpu_tokens_per_sec": "not yet measured",
+        "gpu_tokens_per_sec_range": "not yet measured",
+        "notes": "Tiled SDPA W=64+G=4 (NotImplementedError: FlexAttention does not support backward on CPU.)"
+      },
+      {
+        "config": "i_cuda_graphs",
+        "status": "GPU only, not yet measured",
+        "real_tokens_per_sec": 0.0,
+        "useful_token_fraction": 0.0,
+        "step_time_ms": 0.0,
+        "data_wait_ms": 0.0,
+        "compute_ms": 0.0,
+        "data_wait_fraction": 0.0,
+        "useful_tflops_per_sec": 0.0,
+        "executed_tflops_per_sec": 0.0,
+        "mfu": "N/A",
+        "speedup_vs_baseline": 0.0,
+        "final_loss": NaN,
+        "notes": "GPU only, not yet measured",
+        "real_tokens": 0,
+        "total_tokens": 0,
+        "num_seeds": 5,
+        "gpu_tokens_per_sec": "not yet measured"
+      }
+    ],
+    "peak_flops_per_sec": null,
+    "peak_flops_source": "N/A",
+    "profiler_top_ops": [
+      {
+        "op": "aten::mm",
+        "calls": 34,
+        "self_cpu_ms": 504.133,
+        "self_cuda_ms": 0.0
+      },
+      {
+        "op": "aten::addmm",
+        "calls": 17,
+        "self_cpu_ms": 251.907,
+        "self_cuda_ms": 0.0
+      },
+      {
+        "op": "aten::_scaled_dot_product_flash_attention_for_cpu_backward",
+        "calls": 4,
+        "self_cpu_ms": 80.528,
+        "self_cuda_ms": 0.0
+      },
+      {
+        "op": "aten::_scaled_dot_product_flash_attention_for_cpu",
+        "calls": 4,
+        "self_cpu_ms": 56.162,
+        "self_cuda_ms": 0.0
+      },
+      {
+        "op": "aten::sum",
+        "calls": 20,
+        "self_cpu_ms": 28.445,
+        "self_cuda_ms": 0.0
+      }
+    ],
+    "profiler_top_cpu_ops": [
+      {
+        "op": "aten::mm",
+        "calls": 34,
+        "self_cpu_ms": 504.133,
+        "self_cuda_ms": 0.0
+      },
+      {
+        "op": "aten::addmm",
+        "calls": 17,
+        "self_cpu_ms": 251.907,
+        "self_cuda_ms": 0.0
+      },
+      {
+        "op": "aten::_scaled_dot_product_flash_attention_for_cpu_backward",
+        "calls": 4,
+        "self_cpu_ms": 80.528,
+        "self_cuda_ms": 0.0
+      },
+      {
+        "op": "aten::_scaled_dot_product_flash_attention_for_cpu",
+        "calls": 4,
+        "self_cpu_ms": 56.162,
+        "self_cuda_ms": 0.0
+      },
+      {
+        "op": "aten::sum",
+        "calls": 20,
+        "self_cpu_ms": 28.445,
+        "self_cuda_ms": 0.0
+      }
+    ],
+    "flex_attention_probe": {
+      "device": "cpu",
+      "forward_ok": true,
+      "backward_ok": false,
+      "compiled_ok": false,
+      "note": "NotImplementedError: FlexAttention does not support backward on CPU. Please set the input requires_grad to False or use another device."
+    }
+  }
+}

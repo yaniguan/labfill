@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from labfill.checker import check_protocols_batched
@@ -26,12 +27,16 @@ from labfill.protocol import (
     OP_MIX,
     OP_PICK_TIP,
     OP_SEAL,
+    OP_THAW,
     OP_TRANSFER,
+    OP_UNSEAL,
+    PIP_NONE,
     PIP_P20,
     PIP_P200,
     LabStateBatch,
     ProtocolBatch,
     make_pcr_protocol,
+    make_random_valid_protocols,
     ul,
 )
 
@@ -126,3 +131,56 @@ def test_lablean_ast_roundtrip_and_lean_export_conformance() -> None:
         got_code = int(chk_brk.err_code[idx].item())
         assert got_code == exp_code
         assert err_code_to_lablean(got_code) == exp_lean_tag
+
+
+def test_exporter_strict_mode_fails_loudly_and_never_emits_none_or_drops_ops() -> None:
+    """Issue #38: strict exporter rejects unseal, bad_op, NONE pipettes, and reagentless thaw."""
+    st = LabStateBatch(
+        volume=torch.tensor([[ul(100), 0]], dtype=torch.int64),
+        capacity=torch.tensor([[ul(200), ul(200)]], dtype=torch.int64),
+        sealed=torch.tensor([[True, False]], dtype=torch.bool),
+        frozen=torch.tensor([[False, False]], dtype=torch.bool),
+        reagent_mask=torch.tensor([[0b11, 0]], dtype=torch.int64),
+    )
+
+    # 1. OP_UNSEAL raises in strict=True; emits explicit sentinel in strict=False
+    pr_unseal = ProtocolBatch.from_steps_list([[{"op": OP_UNSEAL, "src": 0}]])
+    with pytest.raises(ValueError, match="unseal"):
+        export_lablean_module(st, pr_unseal, strict=True)
+    src_ns = export_lablean_module(st, pr_unseal, strict=False)
+    assert "__LABFILL_UNSUPPORTED_UNSEAL_" in src_ns
+
+    # 2. Unknown op_code raises in strict=True; emits explicit sentinel in strict=False
+    pr_bad_op = ProtocolBatch.from_steps_list([[{"op": 42}]])
+    with pytest.raises(ValueError, match="unsupported op_code=42"):
+        export_lablean_module(st, pr_bad_op, strict=True)
+    assert "__LABFILL_BAD_OP_42__" in export_lablean_module(st, pr_bad_op, strict=False)
+
+    # 3. Invalid pipette (PIP_NONE=0 or 5) raises in strict=True and NEVER writes bare `NONE`
+    pr_bad_pip = ProtocolBatch.from_steps_list(
+        [[{"op": OP_PICK_TIP}, {"op": OP_TRANSFER, "pipette": PIP_NONE, "src": 0, "dst": 1, "vol": 50}]]
+    )
+    with pytest.raises(ValueError, match="invalid pipette_code"):
+        export_lablean_module(st, pr_bad_pip, strict=True)
+    src_pip = export_lablean_module(st, pr_bad_pip, strict=False)
+    assert "NONE" not in src_pip
+    assert "INVALID_PIP_0" in src_pip
+
+    # 4. Multi-reagent container thaw exports `.thaw` for every reagent bit in that container
+    st_multi_frozen = LabStateBatch(
+        volume=torch.tensor([[ul(100), 0]], dtype=torch.int64),
+        capacity=torch.tensor([[ul(200), ul(200)]], dtype=torch.int64),
+        sealed=torch.zeros((1, 2), dtype=torch.bool),
+        frozen=torch.tensor([[True, False]], dtype=torch.bool),
+        reagent_mask=torch.tensor([[0b11, 0]], dtype=torch.int64),
+    )
+    pr_thaw = ProtocolBatch.from_steps_list([[{"op": OP_THAW, "src": 0}]])
+    lean_thaw = export_lablean_module(st_multi_frozen, pr_thaw, strict=True)
+    assert '.thaw "r0"' in lean_thaw and '.thaw "r1"' in lean_thaw
+
+    # 5. lablean_compatible=True random valid protocols export cleanly under strict=True
+    st_lc, pr_lc = make_random_valid_protocols(16, seed=7, lablean_compatible=True)
+    assert bool(check_protocols_batched(st_lc, pr_lc).ok.all().item())
+    for r_i in range(16):
+        mod = export_lablean_module(st_lc, pr_lc, row=r_i, strict=True)
+        assert "NONE" not in mod

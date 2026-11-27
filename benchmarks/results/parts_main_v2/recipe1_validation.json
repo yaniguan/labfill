@@ -1,0 +1,64 @@
+{
+  "machine": {
+    "date": "2026-11-26",
+    "device_type": "cpu",
+    "cpu_model": "AMD64 Family 26 Model 96 Stepping 0, AuthenticAMD",
+    "cpu_cores": 16,
+    "torch_num_threads": 1,
+    "cpu_isa_highlights": [],
+    "python_version": "3.11.15",
+    "torch_version": "2.14.0+cpu",
+    "cuda_version": null,
+    "flash_attn_available": false,
+    "numpy_version": "2.4.6",
+    "load_avg_1_5_15_at_start": null,
+    "cuda_available": false,
+    "gpu_name": "none (CPU only)",
+    "gpu_compute_capability": null,
+    "gpu_vram_mb": null,
+    "nvidia_smi_telemetry": null
+  },
+  "wall_sec": 8.85,
+  "result": [
+    {
+      "batch_size": 1,
+      "python_proto_per_sec": 29673.6,
+      "python_ms": 0.034,
+      "torch_cpu_proto_per_sec": 16.9,
+      "torch_cpu_ms": 59.25,
+      "torch_vs_python_ratio": 0.001,
+      "torch_gpu_proto_per_sec": "not yet measured",
+      "torch_gpu_ms": "not yet measured"
+    },
+    {
+      "batch_size": 64,
+      "python_proto_per_sec": 25601.0,
+      "python_ms": 2.5,
+      "torch_cpu_proto_per_sec": 849.4,
+      "torch_cpu_ms": 75.344,
+      "torch_vs_python_ratio": 0.033,
+      "torch_gpu_proto_per_sec": "not yet measured",
+      "torch_gpu_ms": "not yet measured"
+    },
+    {
+      "batch_size": 1024,
+      "python_proto_per_sec": 34924.8,
+      "python_ms": 29.32,
+      "torch_cpu_proto_per_sec": 11402.2,
+      "torch_cpu_ms": 89.807,
+      "torch_vs_python_ratio": 0.326,
+      "torch_gpu_proto_per_sec": "not yet measured",
+      "torch_gpu_ms": "not yet measured"
+    },
+    {
+      "batch_size": 16384,
+      "python_proto_per_sec": 23109.4,
+      "python_ms": 708.975,
+      "torch_cpu_proto_per_sec": 26928.9,
+      "torch_cpu_ms": 608.417,
+      "torch_vs_python_ratio": 1.165,
+      "torch_gpu_proto_per_sec": "not yet measured",
+      "torch_gpu_ms": "not yet measured"
+    }
+  ]
+}
