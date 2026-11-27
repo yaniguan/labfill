@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from labfill import fill_gpu as fill_gpu_mod
 from labfill.fill_gpu import (
     CudaGraphStepRunner,
     PackCollate,
@@ -15,14 +16,21 @@ from labfill.fill_gpu import (
     _sequence_start_offsets,
     build_batches_from_items,
     build_block_diag_mask,
+    build_cu_seqlens,
+    build_flex_block_mask,
+    chunk_sequence_pairs,
     collate_padded_pairs,
     collate_varlen_pairs,
+    compute_packed_loss,
     count_batch_training_flops,
+    detect_gpu_peak_flops,
     flex_local_global_attention,
     generate_protocol_sequences,
     pack_sequence_pairs,
+    packed_sequence_ce_loss,
     probe_flex_attention,
     run_fill_gpu_ablation,
+    run_torch_profiler_summary,
     tiled_local_global_attention,
 )
 
@@ -343,3 +351,328 @@ def test_ablation_harness_end_to_end_tiny() -> None:
 
     assert len(prof_ops) > 0
     assert "forward_ok" in flex_info
+
+
+def test_build_cu_seqlens_from_lengths_and_multi_row_seq_id() -> None:
+    cu_len, max_l = build_cu_seqlens([40, 95, 25], dtype=torch.int32)
+    assert cu_len.dtype == torch.int32
+    assert cu_len.tolist() == [0, 40, 135, 160]
+    assert max_l == 95
+
+    # Multi-row seq_id where row 0 ends at pad (or sid=2) and row 1 starts again at sid=1
+    sid = torch.tensor(
+        [
+            [1, 1, 1, 2, 2, 0, 0, 0],
+            [1, 1, 1, 1, 2, 0, 0, 0],
+        ],
+        dtype=torch.int64,
+    )
+    cu_sid, max_sid = build_cu_seqlens(sid)
+    assert cu_sid.tolist() == [0, 3, 5, 9, 10]
+    assert max_sid == 4
+
+    empty_cu, empty_max = build_cu_seqlens(torch.zeros((2, 16), dtype=torch.int64))
+    assert empty_cu.tolist() == [0]
+    assert empty_max == 0
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_packed_varlen_matches_dense_fp32_and_bf16_at_pack_len_4096(
+    causal: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(21)
+    model = ProtocolTransformer(
+        max_seq_len=4096,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        d_ff=128,
+        causal=causal,
+    ).eval()
+
+    pairs = [
+        (torch.randint(4, 220, (ln,), dtype=torch.int64), torch.randint(0, 8, (ln,), dtype=torch.int64))
+        for ln in (64, 180, 96, 120)
+    ]
+    dense_4096 = pack_sequence_pairs(pairs, pack_len=4096, rows_per_batch=1, attn_mode="dense")[0]
+    pvar_4096 = pack_sequence_pairs(pairs, pack_len=4096, rows_per_batch=1, attn_mode="packed_varlen")[0]
+    dense_ref = pack_sequence_pairs(pairs, pack_len=512, rows_per_batch=1, attn_mode="dense")[0]
+
+    assert pvar_4096.input_ids.ndim == 1
+    assert pvar_4096.input_ids.numel() == sum(ln for ln, _ in ( (int(t.numel()), 0) for t, _ in pairs ))
+    assert pvar_4096.cu_seqlens is not None
+    assert int(pvar_4096.cu_seqlens[-1].item()) == pvar_4096.real_tokens
+    assert pvar_4096.max_seqlen == 180
+
+    # Compute reference output with explicit dense mask at S=512 (< 4096)
+    with torch.no_grad():
+        logits_ref = model(dense_ref.input_ids, dense_ref.position_ids, seq_id=dense_ref.seq_id, mode="dense")
+
+    # At pack_len == 4096, neither mode='packed_varlen' nor mode='dense' may allocate build_block_diag_mask!
+    def _forbid_dense_mask(*_args: object, **_kwargs: object) -> torch.Tensor:
+        raise AssertionError("build_block_diag_mask should not be called when S >= 4096")
+
+    monkeypatch.setattr(fill_gpu_mod, "build_block_diag_mask", _forbid_dense_mask)
+
+    with torch.no_grad():
+        logits_pvar = model(
+            pvar_4096.input_ids,
+            pvar_4096.position_ids,
+            cu_seqlens=pvar_4096.cu_seqlens,
+            mode="packed_varlen",
+            max_seqlen=pvar_4096.max_seqlen,
+        )
+        logits_d4096 = model(
+            dense_4096.input_ids,
+            dense_4096.position_ids,
+            seq_id=dense_4096.seq_id,
+            mode="dense",
+        )
+        real_n = pvar_4096.real_tokens
+        assert torch.allclose(logits_pvar, logits_ref[0, :real_n], atol=1e-4)
+        assert torch.allclose(logits_d4096[0, :real_n], logits_ref[0, :real_n], atol=1e-4)
+
+        with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=True):
+            bf16_pvar = model(
+                pvar_4096.input_ids,
+                pvar_4096.position_ids,
+                cu_seqlens=pvar_4096.cu_seqlens,
+                mode="packed_varlen",
+                max_seqlen=pvar_4096.max_seqlen,
+            )
+            bf16_ref = model(
+                dense_4096.input_ids,
+                dense_4096.position_ids,
+                seq_id=dense_4096.seq_id,
+                mode="dense",
+            )
+        assert torch.allclose(bf16_pvar.float(), bf16_ref[0, :real_n].float(), atol=1e-2)
+
+    u_pv, e_pv = count_batch_training_flops(model, pvar_4096)
+    assert abs(u_pv - e_pv) < 1e-6
+
+
+def test_packed_sequence_ce_loss_matches_unpacked_per_sequence_mean_gradients() -> None:
+    torch.manual_seed(31)
+    short = (
+        torch.randint(4, 200, (12,), dtype=torch.int64),
+        torch.tensor([0] * 8 + [1] * 4, dtype=torch.int64),
+    )
+    long = (
+        torch.randint(4, 200, (180,), dtype=torch.int64),
+        torch.tensor([0] * 176 + [2] * 4, dtype=torch.int64),
+    )
+
+    def _grads_for(mode_kind: str) -> list[torch.Tensor]:
+        torch.manual_seed(99)
+        m = ProtocolTransformer(d_model=64, n_heads=4, n_layers=2, d_ff=128, causal=True)
+        m.zero_grad(set_to_none=True)
+        if mode_kind == "unpacked_avg":
+            b1 = collate_padded_pairs([short])
+            b2 = collate_padded_pairs([long])
+            l1 = packed_sequence_ce_loss(
+                m(b1.input_ids, b1.position_ids, seq_id=b1.seq_id, mode="dense"),
+                b1.labels,
+                loss_reduction="sequence_mean",
+                seq_id=b1.seq_id,
+            )
+            l2 = packed_sequence_ce_loss(
+                m(b2.input_ids, b2.position_ids, seq_id=b2.seq_id, mode="dense"),
+                b2.labels,
+                loss_reduction="sequence_mean",
+                seq_id=b2.seq_id,
+            )
+            loss = 0.5 * (l1 + l2)
+        elif mode_kind == "packed_ab":
+            pk = pack_sequence_pairs([short, long], pack_len=256, rows_per_batch=1, attn_mode="dense")[0]
+            logits = m(pk.input_ids, pk.position_ids, seq_id=pk.seq_id, mode="dense")
+            loss = packed_sequence_ce_loss(logits, pk.labels, loss_reduction="sequence_mean", seq_id=pk.seq_id)
+        elif mode_kind == "packed_ba":
+            pk = pack_sequence_pairs([long, short], pack_len=256, rows_per_batch=1, attn_mode="dense")[0]
+            logits = m(pk.input_ids, pk.position_ids, seq_id=pk.seq_id, mode="dense")
+            loss = compute_packed_loss(logits, pk.labels, loss_reduction="sequence_mean", seq_id=pk.seq_id)
+        else:
+            pv = pack_sequence_pairs([short, long], pack_len=256, rows_per_batch=1, attn_mode="packed_varlen")[0]
+            logits = m(pv.input_ids, pv.position_ids, cu_seqlens=pv.cu_seqlens, mode="packed_varlen")
+            loss = packed_sequence_ce_loss(
+                logits, pv.labels, loss_reduction="sequence_mean", cu_seqlens=pv.cu_seqlens
+            )
+        loss.backward()
+        return [p.grad.detach().clone() for p in m.parameters() if p.grad is not None]
+
+    g_unpacked = _grads_for("unpacked_avg")
+    g_ab = _grads_for("packed_ab")
+    g_ba = _grads_for("packed_ba")
+    g_pv = _grads_for("packed_varlen")
+
+    for gu, gab, gba, gpv in zip(g_unpacked, g_ab, g_ba, g_pv, strict=True):
+        assert torch.allclose(gab, gu, atol=1e-5)
+        assert torch.allclose(gba, gu, atol=1e-5)
+        assert torch.allclose(gpv, gu, atol=1e-5)
+
+
+def test_packed_sequence_ce_loss_curriculum_weighted_and_fixed_horizon() -> None:
+    from community_extensions import PackedCurriculumBin, PackedSequenceSlice, materialize_bf16_packed_batch
+
+    pbin = PackedCurriculumBin(
+        bin_cap=32,
+        slices=(
+            PackedSequenceSlice(seq_id=0, offset=0, length=4, curriculum_weight=0.25),
+            PackedSequenceSlice(seq_id=1, offset=4, length=16, curriculum_weight=0.0),
+            PackedSequenceSlice(seq_id=2, offset=20, length=8, curriculum_weight=0.25),
+        ),
+    )
+    mat = materialize_bf16_packed_batch([pbin], bin_cap=32)
+    logits = torch.randn(1, 32, 8, requires_grad=True)
+    labels = torch.full((1, 32), -100, dtype=torch.int64)
+    labels[0, :28] = torch.randint(0, 8, (28,), dtype=torch.int64)
+
+    loss = packed_sequence_ce_loss(
+        logits,
+        labels,
+        loss_reduction="curriculum_weighted",
+        seq_id=mat["seq_ids"],
+        token_weights=mat["curriculum_weights_bf16"],
+    )
+    loss.backward()
+    assert logits.grad is not None
+    # Zero-variance middle sequence [4:20] must receive exact zero gradient!
+    assert float(logits.grad[0, 4:20].abs().max().item()) == 0.0
+    assert float(logits.grad[0, :4].abs().max().item()) > 0.0
+    assert float(logits.grad[0, 20:28].abs().max().item()) > 0.0
+
+    # Fixed-horizon reduction scales inversely with fixed_denom
+    l_h100 = packed_sequence_ce_loss(logits.detach(), labels, loss_reduction="fixed_horizon", fixed_denom=100.0)
+    l_h200 = packed_sequence_ce_loss(logits.detach(), labels, loss_reduction="fixed_horizon", fixed_denom=200.0)
+    assert torch.allclose(l_h100, 2.0 * l_h200, atol=1e-6)
+
+
+def test_protocol_transformer_rejects_oversized_position_ids_and_chunks_cleanly() -> None:
+    model = ProtocolTransformer(max_seq_len=512, d_model=32, n_heads=2, n_layers=1, d_ff=64, causal=False).eval()
+    tok_700 = torch.randint(4, 200, (700,), dtype=torch.int64)
+    lbl_700 = torch.zeros(700, dtype=torch.int64)
+    over_batch = collate_padded_pairs([(tok_700, lbl_700)])
+
+    with pytest.raises(ValueError, match="max_seq_len"):
+        model(over_batch.input_ids, over_batch.position_ids, seq_id=over_batch.seq_id)
+
+    neg_pos = torch.tensor([[-1, 0, 1, 2]], dtype=torch.int64)
+    with pytest.raises(ValueError, match="out of range"):
+        model(torch.ones((1, 4), dtype=torch.int64), neg_pos)
+
+    with torch.no_grad():
+        chunked_logits = model(
+            over_batch.input_ids,
+            over_batch.position_ids,
+            seq_id=over_batch.seq_id,
+            chunk_oversized=True,
+        )
+    assert chunked_logits.shape == (1, 700, model.num_classes)
+
+    chunks = chunk_sequence_pairs([(tok_700, lbl_700)], chunk_len=512)
+    assert [int(t.numel()) for t, _ in chunks] == [512, 188]
+
+    pk_chunked = pack_sequence_pairs([(tok_700, lbl_700)], pack_len=512, rows_per_batch=2, overflow_policy="chunk")
+    assert sum(b.real_tokens for b in pk_chunked) == 700
+
+    with pytest.raises(ValueError, match="length >= 1"):
+        pack_sequence_pairs([(torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64))], pack_len=512)
+
+
+def test_detect_gpu_peak_flops_profiler_fields_and_varlen_bf16_ablation() -> None:
+    a100_fl, a100_desc = detect_gpu_peak_flops("NVIDIA A100-SXM4-80GB", precision="bf16")
+    assert a100_fl == pytest.approx(312.0e12)
+    assert "312.00 TFLOPS" in a100_desc
+
+    h100_sxm, _ = detect_gpu_peak_flops("NVIDIA H100 80GB HBM3", precision="bf16")
+    assert h100_sxm == pytest.approx(989.5e12)
+
+    h100_pcie, _ = detect_gpu_peak_flops("NVIDIA H100 PCIe", precision="bf16")
+    assert h100_pcie == pytest.approx(756.5e12)
+
+    l40s_fl, _ = detect_gpu_peak_flops("NVIDIA L40S", precision="bf16")
+    assert l40s_fl == pytest.approx(362.05e12)
+
+    unk_fl, unk_desc = detect_gpu_peak_flops("Mystery Custom Accelerator")
+    assert unk_fl is None
+    assert "unknown GPU peak" in unk_desc
+
+    ovr_fl, ovr_desc = detect_gpu_peak_flops(None, override_tflops=250.0)
+    assert ovr_fl == pytest.approx(250.0e12)
+    assert "manual override" in ovr_desc
+
+    # Cached BlockMask reuse in flex_local_global_attention
+    sid = _seq_id_row([64, 96], 256)
+    bm = build_flex_block_mask(sid, block_size=64, num_global_tokens=4, causal=False)
+    q = torch.randn(1, 2, 256, 16)
+    out_cached = flex_local_global_attention(q, q, q, seq_id=sid, block_mask=bm, compile_flex=False)
+    assert out_cached.shape == (1, 2, 256, 16)
+
+    # Profiler summary includes self_cuda_ms alongside self_cpu_ms
+    tiny_model = ProtocolTransformer(d_model=32, n_heads=2, n_layers=1, d_ff=64)
+    tiny_batch = collate_padded_pairs([(torch.ones(16, dtype=torch.int64), torch.zeros(16, dtype=torch.int64))])
+    prof_ops = run_torch_profiler_summary(tiny_model, tiny_batch)
+    assert len(prof_ops) > 0
+    assert "self_cpu_ms" in prof_ops[0]
+    assert "self_cuda_ms" in prof_ops[0]
+
+    # Extended ablation with include_varlen_bf16=True and calibrated peak_flops
+    rows_ext, _, _ = run_fill_gpu_ablation(
+        num_sequences=16,
+        batch_size=8,
+        pack_len=256,
+        pack_rows_per_batch=1,
+        d_model=32,
+        n_layers=1,
+        n_heads=2,
+        slow_work_iters=5,
+        peak_flops=10.0e12,
+        seed=0,
+        include_varlen_bf16=True,
+    )
+    by_cfg = {r.config: r for r in rows_ext}
+    assert "e2_packed_varlen_bf16" in by_cfg
+    assert "f2_varlen_bf16_compile" in by_cfg
+    assert by_cfg["e2_packed_varlen_bf16"].status == "ok"
+    assert by_cfg["e2_packed_varlen_bf16"].useful_token_fraction == 1.0
+    assert by_cfg["a_padded_baseline"].mfu.endswith("%")
+    assert rows_ext[-1].config == "i_cuda_graphs"
+
+
+def test_flash_attn_varlen_func_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from labfill.fill_gpu import TransformerBlock
+
+    blk = TransformerBlock(d_model=32, n_heads=2, d_ff=64, causal=True)
+    called_args: dict[str, object] = {}
+
+    class _FakeCudaTensor:
+        pass
+
+    def _mock_flash_varlen(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
+        max_q: int,
+        max_k: int,
+        causal: bool = False,
+    ) -> torch.Tensor:
+        called_args["q_shape"] = tuple(q.shape)
+        called_args["cu_dtype"] = cu_q.dtype
+        called_args["max_q"] = max_q
+        called_args["max_k"] = max_k
+        called_args["causal"] = causal
+        return v.clone()
+
+    monkeypatch.setattr(fill_gpu_mod, "_FLASH_ATTN_VARLEN_FUNC", _mock_flash_varlen)
+
+    # Verify fallback when on CPU (even with bf16 dtype, flash_attn_varlen_func only runs on CUDA)
+    x_cpu = torch.randn(10, 32, dtype=torch.bfloat16)
+    cu = torch.tensor([0, 4, 10], dtype=torch.int64)
+    out_cpu = blk._run_varlen_qkv(x_cpu, x_cpu, x_cpu, cu, max_seqlen=6)
+    assert out_cpu.shape == (10, 32)
+    assert called_args == {}
+
+

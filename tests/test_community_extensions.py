@@ -114,12 +114,101 @@ def test_labfill_lean_module_hygiene() -> None:
         "structure PackedSlice",
         "def checkPackedBin",
         "theorem checkPackedBin_conserves_tokens",
+        "theorem checkPackedBin_unique_seqIds",
         "theorem checkPackedBin_pairwise_disjoint",
+        "theorem checkPackedBin_sum_le_binCap",
+        "theorem attn_zero_cross_sequence_leak",
+        "theorem attn_causal_no_future_leak",
+        "theorem attn_row_nonempty_no_nan",
+        "theorem valid_bins_capacity_lower_bound",
+        "theorem packBFD_all_bins_valid",
+        "theorem packBFD_pairwise_fullness",
+        "theorem packBFD_two_approx",
+        "theorem packBFD_le_two_opt",
         "theorem zero_or_all_pass_has_zero_weight",
     ):
         assert required in src
     assert re.search(r"\bsorry\b", src) is None
     assert re.search(r"\baxiom\b", src) is None
+
+
+def test_duplicate_seq_id_overlap_rejected_and_quarantine_mode() -> None:
+    # Issue #33 counterexample: overlapping slices sharing duplicate seq_id=1 MUST fail
+    s1 = PackedSequenceSlice(seq_id=1, offset=0, length=600)
+    s2 = PackedSequenceSlice(seq_id=1, offset=200, length=400)
+    assert verify_packed_bin(2048, 1000, (s1, s2)) == (False, "packed_slices_non_overlapping")
+
+    # Even non-overlapping duplicate seq_id within one bin MUST fail unique-seqId invariant
+    s3 = PackedSequenceSlice(seq_id=1, offset=600, length=400)
+    assert verify_packed_bin(2048, 1000, (s1, s3)) == (False, "packed_slices_non_overlapping")
+
+    # Issue #32 quarantine mode in pack_curriculum_bins_bfd
+    groups = [
+        PromptGroupRollout(group_id=10, rollout_rewards=(1, 0, 1, 0), token_len=3000),
+        PromptGroupRollout(group_id=11, rollout_rewards=(1, 0, 0, 0), token_len=900),
+        PromptGroupRollout(group_id=12, rollout_rewards=(1, 1, 1, 1), token_len=500),
+        PromptGroupRollout(group_id=13, rollout_rewards=(1, 1, 0, 0), token_len=850),
+    ]
+    bins, dropped, quarantined_ids = pack_curriculum_bins_bfd(
+        groups, bin_cap=2048, overflow_policy="quarantine"
+    )
+    assert dropped == 1
+    assert quarantined_ids == (10,)
+    assert len(bins) == 1
+    assert bins[0].used_tokens == 900 + 850
+
+
+def test_differential_bfd_and_block_diag_mask_against_labfill_lean_invariants() -> None:
+    from community_extensions.curriculum_difficulty_packer import generate_synthetic_rlvr_groups
+    from labfill.fill_gpu import build_block_diag_mask
+
+    # 1. Verify BFD pairwise fullness, capacity lower bound, and 2-approx across random seeds
+    for seed in (1, 7, 19):
+        groups = generate_synthetic_rlvr_groups(num_groups=80, rollouts_per_group=8, bin_cap=1024, seed=seed)
+        bins, _ = pack_curriculum_bins_bfd(groups, bin_cap=1024)
+        assert len(bins) >= 1
+        seen_ids: set[int] = set()
+        for b in bins:
+            ok, rule = verify_packed_bin(1024, b.used_tokens, b.slices)
+            assert ok is True and rule is None
+            for sl in b.slices:
+                assert sl.seq_id not in seen_ids
+                seen_ids.add(sl.seq_id)
+
+        # Pairwise fullness: every pair of distinct bins (i < j) exceeds bin_cap together
+        for i in range(len(bins)):
+            for j in range(i + 1, len(bins)):
+                assert bins[i].used_tokens + bins[j].used_tokens > 1024
+
+        total_tokens = sum(b.used_tokens for b in bins)
+        assert total_tokens <= len(bins) * 1024
+        assert (len(bins) - 1) * 1024 < 2 * total_tokens
+
+    # 2. Differential check of build_block_diag_mask vs Lean allowBlockDiagAttn
+    pbin_list, _ = pack_curriculum_bins_bfd(
+        [
+            PromptGroupRollout(0, (1, 0), 12),
+            PromptGroupRollout(1, (1, 0), 9),
+            PromptGroupRollout(2, (1, 0), 7),
+        ],
+        bin_cap=32,
+    )
+    mat = materialize_bf16_packed_batch(pbin_list, bin_cap=32)
+    sid_t = mat["seq_ids"].to(torch.int64)  # (1, 32)
+    sid_list = sid_t[0].tolist()
+
+    for causal in (False, True):
+        mask = build_block_diag_mask(sid_t, causal=causal)[0, 0]
+        for q in range(32):
+            # NaN-free softmax row: at least one key allowed per query
+            assert bool(mask[q].any().item()) is True
+            for kv in range(32):
+                expected = (
+                    (q == kv)
+                    if sid_list[q] == 0
+                    else (sid_list[q] == sid_list[kv] and ((not causal) or kv <= q))
+                )
+                assert bool(mask[q, kv].item()) is expected
 
 
 def test_run_benchmark_1000_prompt_groups() -> None:
