@@ -33,6 +33,7 @@ from labfill.protocol import (
     ERR_TIP_ALREADY_ON,
     ERR_UNBALANCED,
     HIGH_TEMP_SEAL_C,
+    MAX_CONTAINER_VOL_TENTHS_UL,
     MAX_INCUBATE_C,
     MAX_RPM,
     MIN_INCUBATE_C,
@@ -94,6 +95,50 @@ def _validate_batch_alignment(init_state: LabStateBatch, protocols: ProtocolBatc
         )
 
 
+_LIMB30_MASK = (1 << 30) - 1
+
+
+def _mul_u120_limbs(x: Tensor, y: Tensor) -> tuple[Tensor, Tensor]:
+    """Exact 120-bit unsigned product ``(hi60, lo60)`` of non-negative ``int64`` tensors ``x, y < 2^60``.
+
+    Splits each operand into two 30-bit limbs so every partial product is ``< 2^60`` and ``mid < 2^61``,
+    eliminating signed ``int64`` wrap-around and floating-point rounding up to ``>= 10,000 mL`` containers.
+    """
+    x_pos = x.clamp(min=0)
+    y_pos = y.clamp(min=0)
+    x_hi = x_pos >> 30
+    x_lo = x_pos & _LIMB30_MASK
+    y_hi = y_pos >> 30
+    y_lo = y_pos & _LIMB30_MASK
+
+    p_hh = x_hi * y_hi
+    p_hl = x_hi * y_lo
+    p_lh = x_lo * y_hi
+    p_ll = x_lo * y_lo
+
+    mid = p_hl + p_lh + (p_ll >> 30)
+    lo = ((mid & _LIMB30_MASK) << 30) | (p_ll & _LIMB30_MASK)
+    hi = p_hh + (mid >> 30)
+    return hi, lo
+
+
+def _gt_mul_u120(a: Tensor, b: Tensor, c: Tensor, d: Tensor) -> Tensor:
+    """Return exact integer comparison ``a * b > c * d`` for non-negative ``int64`` tensors ``< 2^60``."""
+    lhs_hi, lhs_lo = _mul_u120_limbs(a, b)
+    rhs_hi, rhs_lo = _mul_u120_limbs(c, d)
+    return (lhs_hi > rhs_hi) | ((lhs_hi == rhs_hi) & (lhs_lo > rhs_lo))
+
+
+def _mul_div_floor_exact(amt: Tensor, vol_num: Tensor, vol_den: Tensor) -> Tensor:
+    """Return exact ``(amt * vol_num) // vol_den`` without ``int64`` overflow for ``0 <= vol_num <= MAX``."""
+    a_pos = amt.clamp(min=0)
+    v_pos = vol_num.clamp(min=0, max=MAX_CONTAINER_VOL_TENTHS_UL)
+    d_pos = vol_den.clamp(min=1)
+    q = a_pos // d_pos
+    r = a_pos % d_pos
+    return q * v_pos + (r * v_pos) // d_pos
+
+
 def _touch_solute(
     t_has: Tensor,
     t_amt: Tensor,
@@ -103,7 +148,7 @@ def _touch_solute(
     active_mask: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
     valid_l = active_mask & (l_amt > 0) & (l_vol > 0)
-    lower = (~t_has) | (l_amt * t_vol < t_amt * l_vol)
+    lower = (~t_has) | _gt_mul_u120(t_amt, l_vol, l_amt, t_vol)
     upd = valid_l & lower
     t_has = torch.where(valid_l, torch.ones_like(t_has), t_has)
     t_amt = torch.where(upd, l_amt, t_amt)
@@ -254,7 +299,12 @@ def check_protocols_batched(
         conc_contam = (
             tip_has_solute
             & (src_vol > 0)
-            & (1000 * src_amt * tip_min_vol > (1000 + CONC_TOL_PERMILLE) * tip_min_amt * src_vol)
+            & _gt_mul_u120(
+                1000 * src_amt.clamp(min=0),
+                tip_min_vol,
+                (1000 + CONC_TOL_PERMILLE) * tip_min_amt.clamp(min=0),
+                src_vol,
+            )
         )
         step_err = torch.where(
             (step_err == 0) & is_pip_op & (bit_contam | conc_contam),
@@ -351,8 +401,8 @@ def check_protocols_batched(
         tip_min_vol = torch.where(pick_ok | drop_ok, one_b, tip_min_vol)
 
         safe_src_vol = src_vol.clamp(min=1)
-        rem_src_amt = (src_amt * (src_vol - vol_t)) // safe_src_vol
-        moved_amt = (src_amt * vol_t) // safe_src_vol
+        rem_src_amt = _mul_div_floor_exact(src_amt, src_vol - vol_t, safe_src_vol)
+        moved_amt = _mul_div_floor_exact(src_amt, vol_t, safe_src_vol)
         post_dst_amt = dst_amt + moved_amt
         post_dst_vol = dst_vol + vol_t
 

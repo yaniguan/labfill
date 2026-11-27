@@ -32,7 +32,9 @@ from labfill.twins import (
     from_preference_jsonl,
     generate_check_keep,
     make_error_twin,
+    map_raw_step_to_compact,
     measure_twin_recall,
+    protocol_field_edit_distance,
     repair_edit_kind,
     sample_noisy_candidates,
     to_preference_jsonl,
@@ -252,3 +254,97 @@ def test_twinstep_and_preference_jsonl_roundtrip(tmp_path: Path) -> None:
     assert len(recs) == 8
     assert not bool(check_protocols_batched(st_rt, bad_rt).ok.any().item())
     assert bool(check_protocols_batched(st_rt, good_rt).ok.all().item())
+
+
+def test_step_index_alignment_across_all_seven_twin_types_and_dpo_roundtrip(tmp_path: Path) -> None:
+    """Issue #39: 64 records x 7 twin types align corrupted_steps[step_index] & twinstep_step_index 100%."""
+    from labfill.protocol import OP_NAMES, OP_SEAL, PIPETTE_NAMES
+
+    st, pr = make_random_valid_protocols(64, seed=5)
+    for idx, et in enumerate(TWIN_ERROR_TYPES):
+        st_b, pr_b = make_error_twin(st, pr, et, seed=6 + idx)
+        chk = check_protocols_batched(st_b, pr_b)
+        rr = batched_repair(st_b, pr_b, reference_protocols=pr)
+        assert rr.repair_rate == 1.0, et
+        assert rr.exact_recovery_rate is not None and rr.mean_field_edit_distance is not None
+
+        ts_records = to_twinstep_records(st_b, pr_b, rr.repaired_protocols, error_type=et)
+        assert len(ts_records) == 64
+
+        for r_i, rec in enumerate(ts_records):
+            raw_t = int(chk.first_err_step[r_i].item())
+            assert rec["raw_step_index"] == raw_t
+            s_idx = rec["step_index"]
+            assert s_idx is not None
+            expected_step = {
+                "op": OP_NAMES[int(pr_b.op[r_i, raw_t].item())],
+                "src": int(pr_b.src[r_i, raw_t].item()),
+                "dst": int(pr_b.dst[r_i, raw_t].item()),
+                "vol": int(pr_b.vol[r_i, raw_t].item()),
+                "temp": int(pr_b.temp[r_i, raw_t].item()),
+                "duration": int(pr_b.duration[r_i, raw_t].item()),
+                "pipette": PIPETTE_NAMES.get(int(pr_b.pipette[r_i, raw_t].item()), "NONE"),
+                "rpm": int(pr_b.rpm[r_i, raw_t].item()),
+            }
+            assert rec["corrupted_steps"][s_idx] == expected_step, (et, r_i)
+
+            ts_idx = rec["twinstep_step_index"]
+            assert ts_idx is not None, (et, r_i)
+            ts_entry = rec["twinstep_steps"][ts_idx]
+            assert ts_entry["type"] == expected_step["op"]
+            if expected_step["op"] == "transfer":
+                assert ts_entry["source"] == f"C{expected_step['src']}"
+                assert ts_entry["dest"] == f"C{expected_step['dst']}"
+            elif expected_step["op"] == "incubate":
+                assert ts_entry["plate"] == f"C{expected_step['src']}"
+                assert ts_entry["temperature"] == float(expected_step["temp"])
+
+        # DPO preference JSONL round-trip index alignment
+        p_path = tmp_path / f"pref_{et}.jsonl"
+        to_preference_jsonl(st_b, pr_b, rr.repaired_protocols, path=p_path, error_type=et)
+        st_rt, bad_rt, good_rt, pref_recs = from_preference_jsonl(p_path)
+        assert len(pref_recs) == 64
+        chk_rt = check_protocols_batched(st_rt, bad_rt)
+        assert bool(check_protocols_batched(st_rt, good_rt).ok.all().item())
+        for r_i, prec in enumerate(pref_recs):
+            rt_raw = int(chk_rt.first_err_step[r_i].item())
+            rt_mapped = map_raw_step_to_compact(bad_rt, r_i, rt_raw)
+            assert rt_mapped == prec["first_err_step"], (et, r_i)
+            assert rt_raw == prec["first_err_step"], (et, r_i)
+
+    # Non-projected failure op (e.g. duplicate seal -> ERR_SEALED on 'seal' step) sets twinstep_step_index=None
+    pr_dup_seal = ProtocolBatch.from_steps_list(
+        [[{"op": OP_SEAL, "src": 3}, {"op": OP_SEAL, "src": 3}]]
+    )
+    st_one = st.index_select(torch.tensor([0]))
+    rec_np = to_twinstep_records(st_one, pr_dup_seal, error_type="dup_seal")[0]
+    assert rec_np["step_index"] == 1
+    assert rec_np["corrupted_steps"][1]["op"] == "seal"
+    assert rec_np["twinstep_step_index"] is None
+
+
+def test_repair_exact_recovery_prior_seal_removal_and_assay_temps() -> None:
+    """Issue #40: sealed_plate recovers 100% by deleting prior seal, and common PCR/assay temps are covered."""
+    st, pr = make_random_valid_protocols(64, seed=22)
+    for et, min_exact in (
+        ("wrong_pipette", 1.0),
+        ("missing_tip", 1.0),
+        ("sealed_plate", 1.0),
+        ("swapped_steps", 1.0),
+    ):
+        st_b, pr_b = make_error_twin(st, pr, et, seed=30)
+        rr = batched_repair(st_b, pr_b, reference_protocols=pr)
+        assert rr.exact_recovery_rate == pytest.approx(min_exact), et
+        assert rr.mean_field_edit_distance == pytest.approx(0.0), et
+
+    # Unsealed high-temp incubation: 37/72/25/55/4 C pass on unsealed container (< 80 C)
+    st_unsealed = LabStateBatch(
+        volume=torch.tensor([[ul(100)]], dtype=torch.int64),
+        capacity=torch.tensor([[ul(200)]], dtype=torch.int64),
+        sealed=torch.zeros((1, 1), dtype=torch.bool),
+        frozen=torch.zeros((1, 1), dtype=torch.bool),
+    )
+    pr_hot = ProtocolBatch.from_steps_list([[{"op": OP_INCUBATE, "src": 0, "temp": 120, "duration": 45}]])
+    rr_hot = batched_repair(st_unsealed, pr_hot)
+    assert rr_hot.repair_rate == 1.0
+    assert protocol_field_edit_distance([{"op": "seal", "src": 0, "dst": 0, "vol": 0, "temp": 0, "duration": 0, "pipette": "NONE", "rpm": 0}], []) == 8

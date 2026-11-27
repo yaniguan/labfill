@@ -38,11 +38,52 @@ from labfill.protocol import (
     OP_TRANSFER,
     OP_UNSEAL,
     PIP_NONE,
+    PIP_P2,
+    PIP_P20,
+    PIP_P200,
+    PIP_P1000,
     PIPETTE_NAMES,
     LabStateBatch,
     ProtocolBatch,
     default_device,
 )
+
+_VALID_LABLEAN_PIP_CODES: frozenset[int] = frozenset({PIP_P2, PIP_P20, PIP_P200, PIP_P1000})
+_VALID_LABLEAN_OP_CODES: frozenset[int] = frozenset(
+    {
+        OP_PICK_TIP,
+        OP_DROP_TIP,
+        OP_TRANSFER,
+        OP_MIX,
+        OP_INCUBATE,
+        OP_THAW,
+        OP_SEAL,
+        OP_CENTRIFUGE,
+    }
+)
+
+# Documented rule-set deltas between labfill (L3 pre-filter) and YLM LabLean (L2 formal checker).
+# Used by live conformance tests to verify zero unexplained accept/reject verdict divergences.
+LABLEAN_DOCUMENTED_DELTAS: dict[str, str] = {
+    "unseal_extension": (
+        "labfill models OP_UNSEAL; LabLean Step has no unseal constructor "
+        "(strict=True raises ValueError; strict=False emits __LABFILL_UNSUPPORTED_UNSEAL_* sentinel)."
+    ),
+    "per_container_vs_per_reagent_thaw": (
+        "labfill tracks frozen per container, rejects redundant thaw (ERR_FROZEN) and frozen incubate "
+        "(ERR_FROZEN); LabLean tracks frozen per Reagent, treats redundant thaw as a no-op, and does "
+        "not check frozen on incubate."
+    ),
+    "high_temp_seal_and_positive_duration_rpm": (
+        "labfill requires sealed containers for incubate >= 80 C (ERR_NOT_SEALED), duration > 0 "
+        "(ERR_BAD_DURATION), and rpm > 0 (ERR_BAD_RPM); LabLean ignores step duration, allows rpm = 0, "
+        "and does not require sealing for high-temp incubate."
+    ),
+    "rotor_volume_5ul_vs_mass_100mg": (
+        "labfill checks 2-slot volume difference <= 5.0 uL (ERR_UNBALANCED); LabLean checks n-slot "
+        "opposite-position mass difference <= 100 mg (~100 uL aqueous)."
+    ),
+}
 
 # Canonical mapping from labfill ERR_* codes to YLM LabLean.Error constructor tags
 ERR_TO_LABLEAN_TAG: dict[int, str] = {
@@ -112,6 +153,12 @@ def err_code_to_lablean(err_code: int) -> str:
 def lablean_error_to_err_code(lean_report_or_tag: str) -> int:
     """Parse a LabLean `report` output (e.g. `'REJECTED: LabLean.Error.overflow ...'`) or tag into `ERR_*`."""
     text = lean_report_or_tag.strip()
+    if "__LABFILL_BAD_OP_" in text:
+        return ERR_BAD_OP
+    if "__LABFILL_UNSUPPORTED_UNSEAL_" in text:
+        return ERR_NOT_SEALED
+    if "__LABFILL_EMPTY_THAW_" in text:
+        return ERR_FROZEN
     if text in LABLEAN_TAG_TO_ERR:
         return LABLEAN_TAG_TO_ERR[text]
     if text.upper() == "OK":
@@ -336,15 +383,44 @@ def from_lablean_ast(
     return state, proto
 
 
-def export_lablean_module(
-    init_state: LabStateBatch,
-    protocols: ProtocolBatch,
-    row: int = 0,
-    namespace: str = "LabfillExport",
-    container_names: Sequence[str] | None = None,
-) -> str:
-    """Emit a self-contained Lean 4 source module (`LabState` + `List Step`) for `YLM/LabLean`."""
-    ast = to_lablean_ast(init_state, protocols, row=row, container_names=container_names)
+def _render_lablean_defs(
+    ast: dict[str, Any],
+    *,
+    strict: bool = True,
+) -> tuple[str, str]:
+    """Render `(init_expr, steps_expr)` for one LabLean AST row.
+
+    When `strict=True` (default), fails loudly with `ValueError` on `OP_UNSEAL`, unknown op codes,
+    invalid pipettes (`NONE` / out of `1..4`), negative `Nat` fields (`vol`, `cap`, `duration`, `rpm`),
+    reagentless container `thaw`, or conflicting per-container frozen flags for the same reagent bit.
+    When `strict=False`, never drops unsupported ops or emits invalid `NONE` identifiers: instead emits
+    type-valid Lean 4 sentinels (`__LABFILL_BAD_OP_*`, `__LABFILL_UNSUPPORTED_UNSEAL_*`, invalid-range
+    `Pipette` structs) so corrupted fuzz suites compile cleanly under `lake env lean`.
+    """
+    c_objs = ast["containers"]
+    known_cids = {str(c_obj["id"]) for c_obj in c_objs}
+
+    if strict:
+        bit_frozen_states: dict[int, set[bool]] = {}
+        for c_obj in c_objs:
+            v_t = int(c_obj["vol_tenths_ul"])
+            cap_t = int(c_obj["cap_tenths_ul"])
+            rm = int(c_obj["reagent_mask"])
+            if v_t < 0 or cap_t < 0:
+                raise ValueError(
+                    f"Container {c_obj['id']!r} has negative volume ({v_t}) or capacity ({cap_t}); "
+                    "LabLean Vol.t is Nat"
+                )
+            if rm < 0:
+                raise ValueError(f"Container {c_obj['id']!r} has negative reagent_mask ({rm})")
+            for b in _bits_of(rm):
+                bit_frozen_states.setdefault(b, set()).add(bool(c_obj["frozen"]))
+        for b, states in bit_frozen_states.items():
+            if len(states) > 1:
+                raise ValueError(
+                    f"Reagent bit {b} appears in both frozen and thawed containers; "
+                    "LabLean models frozen state per reagent rather than per container"
+                )
 
     reagent_lines: list[str] = []
     bit_to_rname: dict[int, str] = {}
@@ -359,16 +435,21 @@ def export_lablean_module(
     container_lines: list[str] = []
     plate_entries: list[str] = []
     sealed_ids: list[str] = []
-    c_reagent_for_thaw: dict[str, str] = {}
+    c_reagents_for_thaw: dict[str, list[str]] = {}
 
-    for c_obj in ast["containers"]:
+    for c_obj in c_objs:
         cid = str(c_obj["id"])
-        v_t = int(c_obj["vol_tenths_ul"])
-        cap_t = int(c_obj["cap_tenths_ul"])
+        v_t = max(int(c_obj["vol_tenths_ul"]), 0)
+        cap_t = max(int(c_obj["cap_tenths_ul"]), 0)
         rm = int(c_obj["reagent_mask"])
         bs = _bits_of(max(rm, 0))
         if bs:
-            c_reagent_for_thaw[cid] = bit_to_rname[bs[0]]
+            c_reagents_for_thaw[cid] = [bit_to_rname[b] for b in bs]
+        elif bool(c_obj["frozen"]):
+            synth_r = f"__frozen_{cid}"
+            c_reagents_for_thaw[cid] = [synth_r]
+            reagent_lines.append(f'    {{ name := "{synth_r}", state := .frozen }}')
+
         if v_t > 0 and bs:
             per_bit = (v_t * AMT_SCALE) // len(bs)
             rem = (v_t * AMT_SCALE) - per_bit * len(bs)
@@ -377,10 +458,14 @@ def export_lablean_module(
                 for k, b in enumerate(bs)
             ]
             contents_str = "[" + ", ".join(contents_items) + "]"
+        elif v_t > 0:
+            # Ensure LabLean initChecks (contents.sum == vol.t * amtScale) passes on reagentless liquid
+            trace_r = f"__liquid_{cid}"
+            reagent_lines.append(f'    {{ name := "{trace_r}", state := .roomTemp, diluent := true }}')
+            contents_str = f'[("{trace_r}", {v_t * AMT_SCALE})]'
         else:
             contents_str = "[]"
 
-        # Model sealable containers as 1-well plates so LabLean `.seal` / `.centrifuge` apply directly
         plate_id = f"PL_{cid}"
         plate_entries.append(f'("{plate_id}", 1000)')
         if c_obj["sealed"]:
@@ -390,54 +475,155 @@ def export_lablean_module(
             f'vol := ⟨{v_t}⟩, contents := {contents_str}, tare := 0 }}'
         )
 
+    tip_str = ""
+    if bool(ast.get("has_tip", False)):
+        t_bits = _bits_of(max(int(ast.get("tip_mask", 0)), 0))
+        if t_bits:
+            amts_str = ", ".join(
+                f'("{bit_to_rname.get(b, f"r{b}")}", {AMT_SCALE})' for b in t_bits
+            )
+            tip_str = f",\n    tip := .held [{{ amts := [{amts_str}], vol := 1 }}]"
+        else:
+            tip_str = ",\n    tip := .held []"
+
     step_lines: list[str] = []
-    for st in ast["steps"]:
+    for step_idx, st in enumerate(ast["steps"]):
         op_code = int(st["op_code"])
         sid = str(st["src"])
         did = str(st["dst"])
         vt = int(st["vol_tenths_ul"])
+        pip_code = int(st["pipette_code"])
         pip_name = str(st["pipette"])
         tc = int(st["temp_c"])
         dur = int(st["duration_s"])
         rpm = int(st["rpm"])
 
+        if op_code == OP_UNSEAL:
+            if strict:
+                raise ValueError(
+                    f"Step {step_idx} uses 'unseal' (OP_UNSEAL on {sid!r}), which has no LabLean.Step "
+                    "equivalent; pass lablean_compatible=True to generators or strict=False"
+                )
+            step_lines.append(f'  .thaw "__LABFILL_UNSUPPORTED_UNSEAL_{sid}__"')
+            continue
+
+        if op_code not in _VALID_LABLEAN_OP_CODES:
+            if strict:
+                raise ValueError(
+                    f"Step {step_idx} has unsupported op_code={op_code} ({st.get('op')!r}); "
+                    f"expected one of {sorted(_VALID_LABLEAN_OP_CODES)}"
+                )
+            step_lines.append(f'  .thaw "__LABFILL_BAD_OP_{op_code}__"')
+            continue
+
         if op_code == OP_PICK_TIP:
             step_lines.append("  .pickTip")
         elif op_code == OP_DROP_TIP:
             step_lines.append("  .dropTip")
-        elif op_code == OP_TRANSFER:
-            step_lines.append(f'  .transfer {pip_name} "{sid}" "{did}" ⟨{vt}⟩')
-        elif op_code == OP_MIX:
-            step_lines.append(f'  .mix {pip_name} "{sid}" ⟨{vt}⟩ 3')
+        elif op_code in (OP_TRANSFER, OP_MIX):
+            if pip_code not in _VALID_LABLEAN_PIP_CODES:
+                if strict:
+                    raise ValueError(
+                        f"Step {step_idx} ({st.get('op')}) has invalid pipette_code={pip_code} "
+                        f"({pip_name!r}); LabLean supports only P2, P20, P200, P1000"
+                    )
+                pip_expr = f'{{ name := "INVALID_PIP_{pip_code}", minV := ⟨1⟩, maxV := ⟨0⟩ }}'
+            else:
+                pip_expr = pip_name
+
+            if vt < 0:
+                if strict:
+                    raise ValueError(
+                        f"Step {step_idx} ({st.get('op')}) has negative vol_tenths_ul={vt}; "
+                        "LabLean Vol.t is Nat"
+                    )
+                vt_nat = 0
+            else:
+                vt_nat = vt
+
+            if op_code == OP_TRANSFER:
+                step_lines.append(f'  .transfer {pip_expr} "{sid}" "{did}" ⟨{vt_nat}⟩')
+            else:
+                step_lines.append(f'  .mix {pip_expr} "{sid}" ⟨{vt_nat}⟩ 3')
         elif op_code == OP_INCUBATE:
-            step_lines.append(f'  .incubate "PL_{sid}" ⟨{tc}⟩ (sec {dur})')
+            if dur < 0 and strict:
+                raise ValueError(
+                    f"Step {step_idx} (incubate) has negative duration_s={dur}; LabLean Time.s is Nat"
+                )
+            dur_nat = max(dur, 0)
+            tc_expr = f"({tc} : Int)" if tc < 0 else str(tc)
+            inc_target = f"PL_{sid}" if sid in known_cids else sid
+            step_lines.append(f'  .incubate "{inc_target}" ⟨{tc_expr}⟩ (sec {dur_nat})')
         elif op_code == OP_THAW:
-            r_target = c_reagent_for_thaw.get(sid, sid)
-            step_lines.append(f'  .thaw "{r_target}"')
+            if sid not in known_cids:
+                step_lines.append(f'  .thaw "{sid}"')
+            else:
+                r_targets = c_reagents_for_thaw.get(sid, [])
+                if not r_targets:
+                    if strict:
+                        raise ValueError(
+                            f"Step {step_idx} (thaw) targets container {sid!r} with no declared "
+                            "reagents; LabLean .thaw operates on reagent names rather than containers"
+                        )
+                    step_lines.append(f'  .thaw "__LABFILL_EMPTY_THAW_{sid}__"')
+                else:
+                    for r_t in r_targets:
+                        step_lines.append(f'  .thaw "{r_t}"')
         elif op_code == OP_SEAL:
-            step_lines.append(f'  .seal "PL_{sid}"')
-        elif op_code == OP_UNSEAL:
-            step_lines.append(f"  -- unseal PL_{sid} (tracked by labfill extension)")
+            seal_target = f"PL_{sid}" if sid in known_cids else sid
+            step_lines.append(f'  .seal "{seal_target}"')
         elif op_code == OP_CENTRIFUGE:
-            step_lines.append(f'  .centrifuge [some "PL_{sid}", some "PL_{did}"] {rpm} (sec {dur})')
+            if strict and (rpm < 0 or dur < 0):
+                raise ValueError(
+                    f"Step {step_idx} (centrifuge) has negative rpm={rpm} or duration_s={dur}; "
+                    "LabLean expects Nat"
+                )
+            rpm_nat = max(rpm, 0)
+            dur_nat = max(dur, 0)
+            s_slot = f"PL_{sid}" if sid in known_cids else sid
+            d_slot = f"PL_{did}" if did in known_cids else did
+            step_lines.append(
+                f'  .centrifuge [some "{s_slot}", some "{d_slot}"] {rpm_nat} (sec {dur_nat})'
+            )
 
     reagents_block = "[\n" + ",\n".join(reagent_lines) + "\n  ]" if reagent_lines else "[]"
     plates_block = "[" + ", ".join(plate_entries) + "]"
     sealed_block = "[" + ", ".join(sealed_ids) + "]"
     cs_block = "[\n" + ",\n".join(container_lines) + "\n  ]" if container_lines else "[]"
-    steps_clean = [ln for ln in step_lines if not ln.lstrip().startswith("--")]
-    steps_block = "[\n" + ",\n".join(steps_clean) + "\n]" if steps_clean else "[]"
+    steps_block = "[\n" + ",\n".join(step_lines) + "\n]" if step_lines else "[]"
 
+    init_expr = (
+        f"  {{ reagents := {reagents_block},\n"
+        f"    plates := {plates_block},\n"
+        f"    sealed := {sealed_block}{tip_str},\n"
+        f"    cs := {cs_block} }}"
+    )
+    return init_expr, steps_block
+
+
+def export_lablean_module(
+    init_state: LabStateBatch,
+    protocols: ProtocolBatch,
+    row: int = 0,
+    namespace: str = "LabfillExport",
+    container_names: Sequence[str] | None = None,
+    *,
+    strict: bool = True,
+) -> str:
+    """Emit a self-contained Lean 4 source module (`LabState` + `List Step`) for `YLM/LabLean`.
+
+    Raises `ValueError` when `strict=True` (default) if the row uses ops/values outside the
+    `YLM/LabLean` `Step` grammar (`OP_UNSEAL`, unknown op codes, `NONE` pipettes, negative `Nat`s).
+    """
+    ast = to_lablean_ast(init_state, protocols, row=row, container_names=container_names)
+    init_expr, steps_block = _render_lablean_defs(ast, strict=strict)
     return "\n".join(
         [
             "import LabLean.Checker",
             f"namespace LabLean.{namespace}",
             "",
             "def init : LabState :=",
-            f"  {{ reagents := {reagents_block},",
-            f"    plates := {plates_block},",
-            f"    sealed := {sealed_block},",
-            f"    cs := {cs_block} }}",
+            init_expr,
             "",
             f"def steps : List Step := {steps_block}",
             "",
@@ -447,3 +633,37 @@ def export_lablean_module(
             "",
         ]
     )
+
+
+def export_lablean_batch_module(
+    items: Sequence[tuple[str, LabStateBatch, ProtocolBatch, int, bool]],
+    module_namespace: str = "LabfillBatchExport",
+) -> str:
+    """Emit one Lean 4 module evaluating `N` `(tag, init_state, protocols, row, strict)` items via `#eval`.
+
+    Each item prints `<tag>\\t<report init steps>` so 300+ protocols compile and evaluate in one
+    `lake env lean` invocation.
+    """
+    lines: list[str] = [
+        "import LabLean.Checker",
+        f"namespace LabLean.{module_namespace}",
+        "",
+    ]
+    for idx, (tag, st, pr, row, strict) in enumerate(items):
+        ast = to_lablean_ast(st, pr, row=row)
+        init_expr, steps_block = _render_lablean_defs(ast, strict=strict)
+        ns = f"Item{idx:04d}"
+        lines.extend(
+            [
+                f"namespace {ns}",
+                "def init : LabState :=",
+                init_expr,
+                f"def steps : List Step := {steps_block}",
+                f'#eval IO.println s!"{tag}\\t{{report init steps}}"',
+                f"end {ns}",
+                "",
+            ]
+        )
+    lines.append(f"end LabLean.{module_namespace}")
+    lines.append("")
+    return "\n".join(lines)

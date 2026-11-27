@@ -1,0 +1,32 @@
+{
+  "machine": {
+    "date": "2026-11-26",
+    "device_type": "cpu",
+    "cpu_model": "AMD64 Family 26 Model 96 Stepping 0, AuthenticAMD",
+    "cpu_cores": 16,
+    "torch_num_threads": 1,
+    "cpu_isa_highlights": [],
+    "python_version": "3.11.15",
+    "torch_version": "2.14.0+cpu",
+    "cuda_version": null,
+    "flash_attn_available": false,
+    "numpy_version": "2.4.6",
+    "load_avg_1_5_15_at_start": null,
+    "cuda_available": false,
+    "gpu_name": "none (CPU only)",
+    "gpu_compute_capability": null,
+    "gpu_vram_mb": null,
+    "nvidia_smi_telemetry": null
+  },
+  "wall_sec": 2.06,
+  "result": {
+    "batch_plates": 128,
+    "steps_per_plate": 104,
+    "all_valid": true,
+    "volume_conserved": true,
+    "cpu_plates_per_sec": 307.1,
+    "cpu_time_ms": 416.75,
+    "gpu_plates_per_sec": "not yet measured",
+    "gpu_time_ms": "not yet measured"
+  }
+}

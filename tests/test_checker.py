@@ -22,6 +22,7 @@ from labfill.protocol import (
     ERR_SEALED,
     ERR_TIP_ALREADY_ON,
     ERR_UNBALANCED,
+    MAX_CONTAINER_VOL_TENTHS_UL,
     OP_CENTRIFUGE,
     OP_DROP_TIP,
     OP_INCUBATE,
@@ -33,6 +34,7 @@ from labfill.protocol import (
     OP_UNSEAL,
     PIP_P20,
     PIP_P200,
+    PIP_P1000,
     LabStateBatch,
     ProtocolBatch,
     make_pcr_protocol,
@@ -303,3 +305,89 @@ def test_incubate_thaw_and_high_temp_seal_preconditions() -> None:
     expected = [c[1] for c in cases]
     assert rb.err_code.tolist() == expected
     assert rp.err_code.tolist() == expected
+
+
+def test_large_reservoir_back_transfer_no_int64_overflow() -> None:
+    """Issue #37: 195 mL + 150 mL reproducer, 12,000 random 1..300 mL pairs, and 10,000 mL carboys."""
+    repro_steps = [
+        {"op": OP_PICK_TIP},
+        {"op": OP_TRANSFER, "pipette": PIP_P1000, "src": 0, "dst": 1, "vol": ul(100.0)},
+        {"op": OP_TRANSFER, "pipette": PIP_P1000, "src": 0, "dst": 1, "vol": ul(100.0)},
+        {"op": OP_DROP_TIP},
+    ]
+
+    # 1. Exact Issue #37 reproducers: 195 mL + 150 mL, smallest overflow boundary, and 10,000 mL limit
+    fixed_pairs = [
+        (ul(195_000.0), ul(150_000.0)),
+        (2_366_227, 389_266),  # 236,622.7 uL + 38,926.6 uL boundary from Issue #37
+        (ul(5_000.0), ul(5_000.0)),
+        (MAX_CONTAINER_VOL_TENTHS_UL, MAX_CONTAINER_VOL_TENTHS_UL - ul(500.0)),
+    ]
+    st_fixed = LabStateBatch(
+        volume=torch.tensor([[a, b] for a, b in fixed_pairs], dtype=torch.int64),
+        capacity=torch.full((len(fixed_pairs), 2), MAX_CONTAINER_VOL_TENTHS_UL, dtype=torch.int64),
+        sealed=torch.zeros((len(fixed_pairs), 2), dtype=torch.bool),
+        frozen=torch.zeros((len(fixed_pairs), 2), dtype=torch.bool),
+        reagent_mask=torch.tensor([[0b11, 0b01]] * len(fixed_pairs), dtype=torch.int64),
+        diluent_mask=1,
+    )
+    pr_fixed = ProtocolBatch.from_steps_list([repro_steps] * len(fixed_pairs))
+    rb_f = check_protocols_batched(st_fixed, pr_fixed)
+    rp_f = check_protocols_python(st_fixed, pr_fixed)
+    assert rb_f.err_code.tolist() == [ERR_CONTAMINATED] * len(fixed_pairs)
+    assert rp_f.err_code.tolist() == [ERR_CONTAMINATED] * len(fixed_pairs)
+    assert rb_f.first_err_step.tolist() == [2] * len(fixed_pairs)
+    assert rp_f.first_err_step.tolist() == [2] * len(fixed_pairs)
+    for fname in ("volume", "capacity", "sealed", "frozen", "reagent_mask", "has_tip", "tip_mask"):
+        assert torch.equal(getattr(rb_f.final_state, fname), getattr(rp_f.final_state, fname)), fname
+
+    # 2. Differential test on 12,000 random large-volume pairs up to 300 mL (including clean + back-transfer mixes)
+    n_rand = 12_000
+    g = torch.Generator(device="cpu").manual_seed(37037)
+    vol_a = torch.randint(ul(1_000.0), ul(299_000.0), (n_rand,), generator=g, dtype=torch.int64)
+    vol_b = torch.randint(0, ul(299_000.0), (n_rand,), generator=g, dtype=torch.int64)
+    # Force ~15% clean empty-well B=0 rows and ~15% near-tolerance diluted rows to exercise both branches
+    vol_b = torch.where(torch.arange(n_rand) % 7 == 0, torch.zeros_like(vol_b), vol_b)
+    cap_ab = torch.full((n_rand, 3), ul(300_000.0), dtype=torch.int64)
+    vol_abc = torch.stack([vol_a, vol_b, torch.zeros_like(vol_a)], dim=1)
+    rmask = torch.zeros((n_rand, 3), dtype=torch.int64)
+    rmask[:, 0] = 0b11
+    rmask[:, 1] = torch.where(vol_b > 0, torch.ones_like(vol_b), torch.zeros_like(vol_b))
+
+    st_rand = LabStateBatch(
+        volume=vol_abc,
+        capacity=cap_ab,
+        sealed=torch.zeros((n_rand, 3), dtype=torch.bool),
+        frozen=torch.zeros((n_rand, 3), dtype=torch.bool),
+        reagent_mask=rmask,
+        diluent_mask=1,
+    )
+    pr_rand = ProtocolBatch.from_steps_list([repro_steps] * n_rand)
+    rb_r = check_protocols_batched(st_rand, pr_rand)
+    rp_r = check_protocols_python(st_rand, pr_rand)
+    assert torch.equal(rb_r.ok, rp_r.ok)
+    assert torch.equal(rb_r.err_code, rp_r.err_code)
+    assert torch.equal(rb_r.first_err_step, rp_r.first_err_step)
+    for fname in ("volume", "capacity", "sealed", "frozen", "reagent_mask", "has_tip", "tip_mask"):
+        assert torch.equal(getattr(rb_r.final_state, fname), getattr(rp_r.final_state, fname)), fname
+    # Sanity check: majority have vol_b > 0 (contaminated) and 1/7 have vol_b == 0 (ok)
+    assert int((rb_r.err_code == ERR_CONTAMINATED).sum().item()) > 9_000
+    assert int((rb_r.err_code == ERR_OK).sum().item()) > 1_500
+
+
+def test_max_container_volume_guard_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="MAX_CONTAINER_VOL_TENTHS_UL"):
+        LabStateBatch(
+            volume=torch.tensor([[100]], dtype=torch.int64),
+            capacity=torch.tensor([[MAX_CONTAINER_VOL_TENTHS_UL + 1]], dtype=torch.int64),
+            sealed=torch.zeros((1, 1), dtype=torch.bool),
+            frozen=torch.zeros((1, 1), dtype=torch.bool),
+        )
+
+    with pytest.raises(ValueError, match="MAX_CONTAINER_VOL_TENTHS_UL"):
+        LabStateBatch(
+            volume=torch.tensor([[MAX_CONTAINER_VOL_TENTHS_UL + 1]], dtype=torch.int64),
+            capacity=torch.tensor([[MAX_CONTAINER_VOL_TENTHS_UL]], dtype=torch.int64),
+            sealed=torch.zeros((1, 1), dtype=torch.bool),
+            frozen=torch.zeros((1, 1), dtype=torch.bool),
+        )

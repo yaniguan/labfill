@@ -108,6 +108,7 @@ MAX_INCUBATE_C = 98
 HIGH_TEMP_SEAL_C = 80     # >= 80 C requires sealed container to prevent evaporation
 AMT_SCALE = 10_000        # 1e-5 uL solute tracking unit, matching LabLean amtScale
 CONC_TOL_PERMILLE = 1     # 0.1% concentration tolerance, matching LabLean concTolPermille
+MAX_CONTAINER_VOL_TENTHS_UL = 100_000_000  # 10,000 mL (10.0 L = 10,000,000.0 uL) safe exact bound
 
 
 def default_device(device: str | torch.device | None = None) -> torch.device:
@@ -136,8 +137,9 @@ class LabStateBatch:
     """Batched state over B protocols and C containers.
 
     Tensors:
-    - volume: (B, C) int64 in 0.1 uL
-    - capacity: (B, C) int64 in 0.1 uL
+    - volume: (B, C) int64 in 0.1 uL (maximum supported volume/capacity:
+      ``MAX_CONTAINER_VOL_TENTHS_UL = 100_000_000``, i.e. ``10,000 mL`` / ``10.0 L``)
+    - capacity: (B, C) int64 in 0.1 uL (must not exceed ``MAX_CONTAINER_VOL_TENTHS_UL``)
     - sealed: (B, C) bool
     - frozen: (B, C) bool
     - reagent_mask: (B, C) int64 bitmask of up to 62 reagents per container
@@ -186,6 +188,27 @@ class LabStateBatch:
 
         if not isinstance(self.diluent_mask, int) or isinstance(self.diluent_mask, bool) or self.diluent_mask < 0:
             raise ValueError(f"diluent_mask must be a non-negative int bitmask, got {self.diluent_mask!r}")
+
+        if (
+            b > 0
+            and c > 0
+            and not torch.compiler.is_compiling()
+            and not (dev.type == "cuda" and torch.cuda.is_current_stream_capturing())
+        ):
+            if bool((self.capacity > MAX_CONTAINER_VOL_TENTHS_UL).any().item()):
+                max_cap = int(self.capacity.max().item())
+                raise ValueError(
+                    f"capacity={max_cap} (0.1 uL, {max_cap / 10_000.0:.1f} mL) exceeds maximum "
+                    f"supported container volume MAX_CONTAINER_VOL_TENTHS_UL={MAX_CONTAINER_VOL_TENTHS_UL} "
+                    f"(10,000.0 mL)"
+                )
+            if bool((self.volume > MAX_CONTAINER_VOL_TENTHS_UL).any().item()):
+                max_vol = int(self.volume.max().item())
+                raise ValueError(
+                    f"volume={max_vol} (0.1 uL, {max_vol / 10_000.0:.1f} mL) exceeds maximum "
+                    f"supported container volume MAX_CONTAINER_VOL_TENTHS_UL={MAX_CONTAINER_VOL_TENTHS_UL} "
+                    f"(10,000.0 mL)"
+                )
 
     @property
     def batch_size(self) -> int:
@@ -528,8 +551,14 @@ def make_random_valid_protocols(
     num_containers: int = 8,
     seed: int = 0,
     device: str | torch.device | None = None,
+    lablean_compatible: bool = False,
 ) -> tuple[LabStateBatch, ProtocolBatch]:
-    """Generate B diverse valid protocols exercising all ops (thaw, tip, transfer, mix, incubate, seal/unseal, centrifuge)."""
+    """Generate B diverse valid protocols exercising thaw, tip, transfer, mix, incubate, seal, and centrifuge.
+
+    When `lablean_compatible=True`, omits `OP_UNSEAL` (which `YLM/LabLean` does not define) and keeps
+    container 3 sealed directly from incubation into optional centrifugation so every generated row
+    is valid under both `labfill` and `YLM/LabLean` with `strict=True` export.
+    """
     if num_containers < 6:
         raise ValueError("num_containers must be >= 6")
     if max_steps < 12:
@@ -631,16 +660,29 @@ def make_random_valid_protocols(
     pad_mask[:, cur] = False
     cur += 1
 
-    op[:, cur] = OP_UNSEAL
-    src[:, cur] = 3
-    pad_mask[:, cur] = False
-    cur += 1
+    if not lablean_compatible:
+        op[:, cur] = OP_UNSEAL
+        src[:, cur] = 3
+        pad_mask[:, cur] = False
+        cur += 1
 
     # Variable length: on ~70% of protocols where well 3 and C-1 are within rotor tolerance,
-    # append seal + seal + centrifuge; the rest stay padded
+    # append seal(s) + centrifuge; the rest stay padded
     balanced = (tracked_vol[:, 3] - tracked_vol[:, num_containers - 1]).abs() <= ROTOR_TOL_TENTHS_UL
     do_spin = balanced & (torch.rand((batch_size,), generator=g) > 0.3)
-    if cur + 3 <= max_steps:
+    if lablean_compatible:
+        if cur + 2 <= max_steps:
+            op[do_spin, cur] = OP_SEAL
+            src[do_spin, cur] = num_containers - 1
+            pad_mask[do_spin, cur] = False
+
+            op[do_spin, cur + 1] = OP_CENTRIFUGE
+            src[do_spin, cur + 1] = 3
+            dst[do_spin, cur + 1] = num_containers - 1
+            rpm[do_spin, cur + 1] = torch.randint(500, 12000, (int(do_spin.sum()),), generator=g)
+            duration[do_spin, cur + 1] = 30
+            pad_mask[do_spin, cur + 1] = False
+    elif cur + 3 <= max_steps:
         op[do_spin, cur] = OP_SEAL
         src[do_spin, cur] = 3
         pad_mask[do_spin, cur] = False
@@ -685,6 +727,7 @@ def make_random_protocols(
     error_prob: float = 0.5,
     seed: int = 0,
     device: str | torch.device | None = None,
+    lablean_compatible: bool = False,
 ) -> tuple[LabStateBatch, ProtocolBatch]:
     """Generate a mix of valid protocols and random/corrupted protocols for differential testing."""
     state, proto = make_random_valid_protocols(
@@ -693,6 +736,7 @@ def make_random_protocols(
         num_containers=num_containers,
         seed=seed,
         device="cpu",
+        lablean_compatible=lablean_compatible,
     )
     g = torch.Generator(device="cpu")
     g.manual_seed(seed + 99991)
